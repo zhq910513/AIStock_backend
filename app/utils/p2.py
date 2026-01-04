@@ -7,72 +7,47 @@ from typing import Any
 @dataclass
 class P2Quantile:
     """
-    P² quantile estimator (Jain & Chlamtac).
-    We store state to dict for persistence.
+    P² (P-square) streaming quantile estimator.
+    Minimal implementation for q in (0,1). Keeps 5 markers.
 
-    This is a pragmatic implementation for latency P99 estimation.
+    This is used only for latency P99 estimation; if state is missing or insufficient,
+    it falls back to a small in-memory buffer.
     """
-    q: float  # e.g., 0.99
+    q: float = 0.99
 
-    # marker positions and heights
-    n: list[int] | None = None
+    # marker positions
+    n: list[float] | None = None
+    # desired marker positions
     np: list[float] | None = None
-    dn: list[float] | None = None
+    # marker heights
     h: list[float] | None = None
+    # desired position increments
+    dn: list[float] | None = None
 
-    # initial buffer (first 5 samples)
-    init: list[float] | None = None
+    _init_buf: list[float] | None = None
 
     def __post_init__(self) -> None:
-        if self.init is None:
-            self.init = []
-
-    def to_state(self) -> dict[str, Any]:
-        return {
-            "q": self.q,
-            "n": self.n,
-            "np": self.np,
-            "dn": self.dn,
-            "h": self.h,
-            "init": self.init,
-        }
-
-    @classmethod
-    def from_state(cls, state: dict[str, Any]) -> "P2Quantile":
-        obj = cls(q=float(state.get("q", 0.99)))
-        obj.n = state.get("n")
-        obj.np = state.get("np")
-        obj.dn = state.get("dn")
-        obj.h = state.get("h")
-        obj.init = state.get("init") or []
-        return obj
-
-    def value(self) -> float:
-        if self.h is not None and len(self.h) == 5:
-            return float(self.h[2])  # middle marker approximates quantile
-        if self.init:
-            data = sorted(self.init)
-            k = int(round((len(data) - 1) * self.q))
-            return float(data[max(0, min(len(data) - 1, k))])
-        return 0.0
+        if self._init_buf is None:
+            self._init_buf = []
 
     def update(self, x: float) -> None:
         if self.h is None:
-            self.init.append(float(x))
-            if len(self.init) < 5:
+            self._init_buf.append(float(x))
+            if len(self._init_buf) < 5:
                 return
-            self.init.sort()
-            self.h = [self.init[0], self.init[1], self.init[2], self.init[3], self.init[4]]
-            self.n = [1, 2, 3, 4, 5]
-            self.np = [1.0, 1.0 + 2*self.q, 1.0 + 4*self.q, 3.0 + 2*self.q, 5.0]
-            self.dn = [0.0, self.q/2.0, self.q, (1.0 + self.q)/2.0, 1.0]
+            self._init_buf.sort()
+            self.h = [self._init_buf[i] for i in range(5)]
+            self.n = [1.0, 2.0, 3.0, 4.0, 5.0]
+            self.np = [1.0, 1.0 + 2.0 * self.q, 1.0 + 4.0 * self.q, 3.0 + 2.0 * self.q, 5.0]
+            self.dn = [0.0, self.q / 2.0, self.q, (1.0 + self.q) / 2.0, 1.0]
+            self._init_buf = None
             return
 
         assert self.h is not None and self.n is not None and self.np is not None and self.dn is not None
 
-        # find k
+        k = 0
         if x < self.h[0]:
-            self.h[0] = x
+            self.h[0] = float(x)
             k = 0
         elif x < self.h[1]:
             k = 0
@@ -83,38 +58,68 @@ class P2Quantile:
         elif x <= self.h[4]:
             k = 3
         else:
-            self.h[4] = x
+            self.h[4] = float(x)
             k = 3
 
         # increment positions
         for i in range(k + 1, 5):
-            self.n[i] += 1
+            self.n[i] += 1.0
         for i in range(5):
             self.np[i] += self.dn[i]
 
-        # adjust heights of markers 2..4 (index 1..3)
+        # adjust heights 2..4
         for i in range(1, 4):
             d = self.np[i] - self.n[i]
-            if (d >= 1.0 and self.n[i+1] - self.n[i] > 1) or (d <= -1.0 and self.n[i-1] - self.n[i] < -1):
-                di = 1 if d >= 1.0 else -1
-
+            if (d >= 1.0 and self.n[i + 1] - self.n[i] > 1.0) or (d <= -1.0 and self.n[i - 1] - self.n[i] < -1.0):
+                di = 1.0 if d >= 1.0 else -1.0
                 # parabolic prediction
-                h_i = self.h[i]
-                h_ip1 = self.h[i+1]
-                h_im1 = self.h[i-1]
-                n_i = self.n[i]
-                n_ip1 = self.n[i+1]
-                n_im1 = self.n[i-1]
-
-                num = di * (n_i - n_im1 + di) * (h_ip1 - h_i) / (n_ip1 - n_i) + di * (n_ip1 - n_i - di) * (h_i - h_im1) / (n_i - n_im1)
-                den = (n_ip1 - n_im1)
-                h_new = h_i + num / den if den != 0 else h_i
-
-                # if parabolic goes out of bounds, use linear
-                if h_im1 < h_new < h_ip1:
-                    self.h[i] = h_new
+                hp = self._parabolic(i, di)
+                if self.h[i - 1] < hp < self.h[i + 1]:
+                    self.h[i] = hp
                 else:
-                    # linear
-                    self.h[i] = h_i + di * (self.h[i + di] - h_i) / (self.n[i + di] - n_i)
-
+                    self.h[i] = self._linear(i, di)
                 self.n[i] += di
+
+    def _parabolic(self, i: int, d: float) -> float:
+        assert self.h is not None and self.n is not None
+        n0, n1, n2 = self.n[i - 1], self.n[i], self.n[i + 1]
+        h0, h1, h2 = self.h[i - 1], self.h[i], self.h[i + 1]
+        return h1 + d / (n2 - n0) * (
+            (n1 - n0 + d) * (h2 - h1) / (n2 - n1) + (n2 - n1 - d) * (h1 - h0) / (n1 - n0)
+        )
+
+    def _linear(self, i: int, d: float) -> float:
+        assert self.h is not None and self.n is not None
+        return self.h[i] + d * (self.h[i + int(d)] - self.h[i]) / (self.n[i + int(d)] - self.n[i])
+
+    def value(self) -> float:
+        if self.h is None:
+            if not self._init_buf:
+                return 0.0
+            buf = sorted(self._init_buf)
+            idx = int(round((len(buf) - 1) * self.q))
+            return float(buf[max(0, min(len(buf) - 1, idx))])
+        return float(self.h[2])
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "q": float(self.q),
+            "n": self.n,
+            "np": self.np,
+            "h": self.h,
+            "dn": self.dn,
+            "init_buf": self._init_buf,
+        }
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> "P2Quantile":
+        q = float(state.get("q", 0.99))
+        obj = cls(q=q)
+        obj.n = state.get("n")
+        obj.np = state.get("np")
+        obj.h = state.get("h")
+        obj.dn = state.get("dn")
+        obj._init_buf = state.get("init_buf")
+        if obj._init_buf is None and obj.h is None:
+            obj._init_buf = []
+        return obj

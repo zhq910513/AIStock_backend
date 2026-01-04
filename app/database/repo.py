@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
-
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -56,6 +55,13 @@ class SystemStatusRepo:
         st.veto_code = veto_code
         st.updated_at = now_shanghai()
 
+    def set_guard_level(self, level: int, veto: bool, veto_code: str) -> None:
+        st = self.get_for_update()
+        st.guard_level = int(level)
+        st.veto = bool(veto)
+        st.veto_code = str(veto_code or "")
+        st.updated_at = now_shanghai()
+
     def set_challenge(self, code: str | None) -> None:
         st = self.get_for_update()
         st.challenge_code = code
@@ -78,10 +84,29 @@ class SystemStatusRepo:
 
 
 @dataclass
+class AccountsRepo:
+    s: Session
+
+    def ensure_accounts_seeded(self) -> None:
+        now = now_shanghai()
+        ids = [x.strip() for x in (settings.ACCOUNT_IDS or "").split(",") if x.strip()]
+        if not ids:
+            ids = [settings.DEFAULT_ACCOUNT_ID]
+
+        for aid in ids:
+            row = self.s.get(models.Account, aid)
+            if row is None:
+                self.s.add(models.Account(account_id=aid, broker_type="MOCK", config={}, created_at=now))
+
+    def list_accounts(self) -> list[models.Account]:
+        return self.s.execute(select(models.Account).order_by(models.Account.account_id.asc())).scalars().all()
+
+
+@dataclass
 class NonceRepo:
     s: Session
 
-    def next_nonce(self, symbol: str, strategy_id: str) -> int:
+    def next_nonce(self, symbol: str, strategy_id: str, account_id: str) -> int:
         td = trading_day_str(now_shanghai())
         row = (
             self.s.execute(
@@ -90,6 +115,7 @@ class NonceRepo:
                     models.NonceCursor.trading_day == td,
                     models.NonceCursor.symbol == symbol,
                     models.NonceCursor.strategy_id == strategy_id,
+                    models.NonceCursor.account_id == account_id,
                 )
                 .with_for_update()
             )
@@ -100,6 +126,7 @@ class NonceRepo:
                 trading_day=td,
                 symbol=symbol,
                 strategy_id=strategy_id,
+                account_id=account_id,
                 last_nonce=0,
                 updated_at=now_shanghai(),
             )
@@ -114,15 +141,16 @@ class NonceRepo:
 class SymbolLockRepo:
     s: Session
 
-    def is_locked(self, symbol: str) -> bool:
-        row = self.s.get(models.SymbolLock, symbol)
+    def is_locked(self, symbol: str, account_id: str = "GLOBAL") -> bool:
+        row = self.s.get(models.SymbolLock, {"account_id": account_id, "symbol": symbol})
         return bool(row.locked) if row else False
 
-    def lock(self, symbol: str, reason: str, ref: str | None) -> None:
+    def lock(self, symbol: str, reason: str, ref: str | None, account_id: str = "GLOBAL") -> None:
         now = now_shanghai()
-        row = self.s.get(models.SymbolLock, symbol)
+        row = self.s.get(models.SymbolLock, {"account_id": account_id, "symbol": symbol})
         if row is None:
             row = models.SymbolLock(
+                account_id=account_id,
                 symbol=symbol,
                 locked=True,
                 lock_reason=reason,
@@ -137,8 +165,8 @@ class SymbolLockRepo:
             row.lock_ref = ref
             row.updated_at = now
 
-    def unlock(self, symbol: str) -> None:
-        row = self.s.get(models.SymbolLock, symbol)
+    def unlock(self, symbol: str, account_id: str = "GLOBAL") -> None:
+        row = self.s.get(models.SymbolLock, {"account_id": account_id, "symbol": symbol})
         if row:
             row.locked = False
             row.lock_reason = ""
@@ -191,16 +219,19 @@ class OutboxRepo:
         ev.last_error = None
 
     def _backoff_ms(self, attempts: int) -> int:
-        # deterministic exponential backoff with cap
         base = int(settings.OUTBOX_BACKOFF_BASE_MS)
         cap = int(settings.OUTBOX_BACKOFF_MAX_MS)
-        # attempts starts at 1 on first failure
         ms = base * (2 ** max(0, attempts - 1))
         return int(min(cap, ms))
 
-    def mark_failed(self, ev: models.OutboxEvent, err: str) -> None:
+    def mark_failed(self, ev: models.OutboxEvent, err: str, write_op: bool = False) -> None:
         ev.attempts = int(ev.attempts) + 1
         ev.last_error = (err or "")[:500]
+
+        if write_op:
+            ev.status = "DEAD"
+            ev.available_at = now_shanghai()
+            return
 
         if int(ev.attempts) >= int(settings.OUTBOX_MAX_ATTEMPTS):
             ev.status = "DEAD"
@@ -219,6 +250,7 @@ class OrderAnchorRepo:
     def upsert_anchor(
         self,
         cid: str,
+        account_id: str,
         client_order_id: str,
         broker_order_id: str | None,
         request_uuid: str,
@@ -230,6 +262,7 @@ class OrderAnchorRepo:
         if row is None:
             row = models.OrderAnchor(
                 cid=cid,
+                account_id=account_id,
                 client_order_id=client_order_id,
                 broker_order_id=broker_order_id,
                 request_uuid=request_uuid,
@@ -292,6 +325,159 @@ class FrozenVersionsRepo:
 
 
 @dataclass
+class DataRequestsRepo:
+    s: Session
+
+    def enqueue(
+        self,
+        *,
+        dedupe_key: str,
+        correlation_id: str | None,
+        account_id: str | None,
+        symbol: str | None,
+        purpose: str,
+        provider: str,
+        endpoint: str,
+        params_canonical: str,
+        request_payload: dict,
+        deadline_sec: int | None = None,
+    ) -> str:
+        exists = self.s.execute(select(models.DataRequest).where(models.DataRequest.dedupe_key == dedupe_key)).scalar_one_or_none()
+        if exists is not None:
+            return str(exists.request_id)
+
+        now = now_shanghai()
+        rid = sha256_hex(f"{dedupe_key}|{now.isoformat()}".encode("utf-8"))[:32]
+        self.s.add(
+            models.DataRequest(
+                request_id=rid,
+                dedupe_key=dedupe_key,
+                correlation_id=correlation_id,
+                account_id=account_id,
+                symbol=symbol,
+                purpose=purpose,
+                provider=provider,
+                endpoint=endpoint,
+                params_canonical=params_canonical,
+                request_payload=request_payload,
+                status="PENDING",
+                attempts=0,
+                last_error=None,
+                created_at=now,
+                sent_at=None,
+                deadline_at=(now + timedelta(seconds=int(deadline_sec))) if deadline_sec else None,
+                response_id=None,
+            )
+        )
+        return rid
+
+    def fetch_pending(self, limit: int = 50) -> list[models.DataRequest]:
+        return (
+            self.s.execute(
+                select(models.DataRequest)
+                .where(models.DataRequest.status == "PENDING")
+                .order_by(models.DataRequest.created_at.asc())
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+            .scalars()
+            .all()
+        )
+
+    def mark_sent(self, req: models.DataRequest) -> None:
+        req.status = "SENT"
+        req.sent_at = now_shanghai()
+        req.attempts = int(req.attempts) + 1
+
+    def mark_failed(self, req: models.DataRequest, err: str) -> None:
+        req.status = "FAILED"
+        req.last_error = (err or "")[:500]
+
+    def attach_response(self, req: models.DataRequest, resp: models.DataResponse) -> None:
+        req.status = "RECEIVED"
+        req.response_id = resp.response_id
+
+
+@dataclass
+class DataResponsesRepo:
+    s: Session
+
+    def write(
+        self,
+        *,
+        request_id: str,
+        provider: str,
+        endpoint: str,
+        http_status: int | None,
+        errorcode: str,
+        errmsg: str,
+        quota_context: str,
+        raw: dict,
+        payload_sha256: str,
+        data_ts=None,
+    ) -> str:
+        resp_id = sha256_hex(f"RESP|{request_id}|{payload_sha256}".encode("utf-8"))[:32]
+        row = self.s.get(models.DataResponse, resp_id)
+        if row is not None:
+            return resp_id
+
+        self.s.add(
+            models.DataResponse(
+                response_id=resp_id,
+                request_id=request_id,
+                provider=provider,
+                endpoint=endpoint,
+                http_status=http_status,
+                errorcode=str(errorcode or "0"),
+                errmsg=str(errmsg or ""),
+                quota_context=str(quota_context or ""),
+                raw=raw,
+                payload_sha256=payload_sha256,
+                received_at=now_shanghai(),
+                data_ts=data_ts,
+            )
+        )
+        return resp_id
+
+
+@dataclass
+class ValidationsRepo:
+    s: Session
+
+    def write(
+        self,
+        *,
+        decision_id: str,
+        symbol: str,
+        hypothesis: str,
+        request_ids: list[str],
+        evidence: dict,
+        conclusion: str,
+        score: float,
+    ) -> str:
+        material = f"{decision_id}|{symbol}|{hypothesis}|{request_ids}|{conclusion}|{score}"
+        vid = sha256_hex(material.encode("utf-8"))[:64]
+        row = self.s.get(models.ValidationRecord, vid)
+        if row is not None:
+            return vid
+
+        self.s.add(
+            models.ValidationRecord(
+                validation_id=vid,
+                decision_id=decision_id,
+                symbol=symbol,
+                hypothesis=hypothesis,
+                request_ids=request_ids,
+                evidence=evidence,
+                conclusion=conclusion,
+                score=float(score),
+                created_at=now_shanghai(),
+            )
+        )
+        return vid
+
+
+@dataclass
 class Repo:
     s: Session
 
@@ -302,6 +488,10 @@ class Repo:
     @property
     def system_status(self) -> SystemStatusRepo:
         return SystemStatusRepo(self.s)
+
+    @property
+    def accounts(self) -> AccountsRepo:
+        return AccountsRepo(self.s)
 
     @property
     def nonce(self) -> NonceRepo:
@@ -322,3 +512,15 @@ class Repo:
     @property
     def frozen_versions(self) -> FrozenVersionsRepo:
         return FrozenVersionsRepo(self.s)
+
+    @property
+    def data_requests(self) -> DataRequestsRepo:
+        return DataRequestsRepo(self.s)
+
+    @property
+    def data_responses(self) -> DataResponsesRepo:
+        return DataResponsesRepo(self.s)
+
+    @property
+    def validations(self) -> ValidationsRepo:
+        return ValidationsRepo(self.s)

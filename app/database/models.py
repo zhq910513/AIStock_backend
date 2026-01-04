@@ -19,6 +19,23 @@ from sqlalchemy.orm import declarative_base, relationship
 Base = declarative_base()
 
 
+# ---------------------------
+# Accounts
+# ---------------------------
+
+class Account(Base):
+    __tablename__ = "accounts"
+
+    account_id = Column(String(32), primary_key=True)
+    broker_type = Column(String(32), nullable=False, default="MOCK")  # MOCK / BROKER_X
+    config = Column(JSONB, nullable=False, default=dict)  # tokens, routing metadata (non-secret)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+# ---------------------------
+# Data plane: raw events + requests/responses
+# ---------------------------
+
 class RawMarketEvent(Base):
     __tablename__ = "raw_market_events"
 
@@ -61,6 +78,78 @@ class RawMarketEvent(Base):
     )
 
 
+class DataRequest(Base):
+    __tablename__ = "data_requests"
+
+    request_id = Column(String(32), primary_key=True)
+    dedupe_key = Column(String(128), nullable=False, unique=True)
+
+    correlation_id = Column(String(64), nullable=True, index=True)
+    account_id = Column(String(32), nullable=True, index=True)
+
+    symbol = Column(String(32), nullable=True, index=True)
+    purpose = Column(String(32), nullable=False)  # PLAN/VERIFY/RESEARCH/INGEST
+    provider = Column(String(32), nullable=False)  # IFIND_HTTP/MOCK/...
+    endpoint = Column(String(64), nullable=False)  # real_time_quotation / cmd_history_quotation / ...
+
+    params_canonical = Column(String(2048), nullable=False)
+    request_payload = Column(JSONB, nullable=False, default=dict)
+
+    status = Column(String(16), nullable=False, default="PENDING")  # PENDING/SENT/RECEIVED/FAILED
+    attempts = Column(Integer, nullable=False, default=0)
+    last_error = Column(String(512), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    deadline_at = Column(DateTime(timezone=True), nullable=True)
+
+    response_id = Column(String(32), nullable=True, index=True)
+
+    __table_args__ = (
+        Index("ix_data_requests_status_created", "status", "created_at"),
+        Index("ix_data_requests_symbol_created", "symbol", "created_at"),
+    )
+
+
+class DataResponse(Base):
+    __tablename__ = "data_responses"
+
+    response_id = Column(String(32), primary_key=True)
+
+    request_id = Column(String(32), ForeignKey("data_requests.request_id", ondelete="CASCADE"), nullable=False, index=True)
+    provider = Column(String(32), nullable=False)
+    endpoint = Column(String(64), nullable=False)
+
+    http_status = Column(Integer, nullable=True)
+    errorcode = Column(String(64), nullable=False, default="0")
+    errmsg = Column(String(512), nullable=False, default="")
+
+    quota_context = Column(String(512), nullable=False, default="")
+    raw = Column(JSONB, nullable=False, default=dict)
+    payload_sha256 = Column(String(64), nullable=False)
+
+    received_at = Column(DateTime(timezone=True), nullable=False)
+    data_ts = Column(DateTime(timezone=True), nullable=True)
+
+    request = relationship("DataRequest")
+
+
+class ValidationRecord(Base):
+    __tablename__ = "validations"
+
+    validation_id = Column(String(64), primary_key=True)
+    decision_id = Column(String(64), nullable=False, index=True)
+    symbol = Column(String(32), nullable=False, index=True)
+
+    hypothesis = Column(String(512), nullable=False)
+    request_ids = Column(JSONB, nullable=False, default=list)  # list[str]
+    evidence = Column(JSONB, nullable=False, default=dict)
+    conclusion = Column(String(32), nullable=False)  # PASS/FAIL/INCONCLUSIVE
+
+    score = Column(Float, nullable=False, default=0.0)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class ChannelCursor(Base):
     __tablename__ = "channel_cursor"
 
@@ -95,6 +184,8 @@ class NonceCursor(Base):
     trading_day = Column(String(8), primary_key=True)
     symbol = Column(String(32), primary_key=True)
     strategy_id = Column(String(64), primary_key=True)
+    account_id = Column(String(32), primary_key=True)
+
     last_nonce = Column(Integer, nullable=False, default=0)
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
@@ -102,7 +193,9 @@ class NonceCursor(Base):
 class SymbolLock(Base):
     __tablename__ = "symbol_locks"
 
+    account_id = Column(String(32), primary_key=True)
     symbol = Column(String(32), primary_key=True)
+
     locked = Column(Boolean, nullable=False, default=False)
     lock_reason = Column(String(64), nullable=False, default="")
     lock_ref = Column(String(128), nullable=True)
@@ -110,10 +203,16 @@ class SymbolLock(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
 
+# ---------------------------
+# Decision plane
+# ---------------------------
+
 class Signal(Base):
     __tablename__ = "signals"
 
     cid = Column(String(64), primary_key=True)
+    account_id = Column(String(32), nullable=False, index=True)
+
     trading_day = Column(String(8), nullable=False)
     symbol = Column(String(32), nullable=False)
     strategy_id = Column(String(64), nullable=False)
@@ -142,10 +241,19 @@ class DecisionBundle(Base):
 
     decision_id = Column(String(64), primary_key=True)
     cid = Column(String(64), nullable=True, index=True)
+    account_id = Column(String(32), nullable=True, index=True)
+    symbol = Column(String(32), nullable=False, index=True)
 
-    decision = Column(String(8), nullable=False)
+    decision = Column(String(16), nullable=False)
     reason_code = Column(String(64), nullable=False)
     params = Column(JSONB, nullable=False, default=dict)
+
+    # auditability
+    request_ids = Column(JSONB, nullable=False, default=list)
+    model_hash = Column(String(64), nullable=False, default="")
+    feature_hash = Column(String(64), nullable=False, default="")
+    seed_set_hash = Column(String(64), nullable=False, default="")
+    rng_seed_hash = Column(String(64), nullable=False, default="")
 
     guard_status = Column(JSONB, nullable=False, default=dict)
     data_quality = Column(JSONB, nullable=False, default=dict)
@@ -158,6 +266,8 @@ class DecisionBundle(Base):
 
     lineage_ref = Column(String(64), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (Index("ix_decision_symbol_time", "symbol", "created_at"),)
 
 
 class RuleSet(Base):
@@ -189,12 +299,18 @@ class DailyFrozenVersions(Base):
     created_at = Column(DateTime(timezone=True), nullable=False)
 
 
+# ---------------------------
+# Execution plane
+# ---------------------------
+
 class Order(Base):
     __tablename__ = "orders"
 
     cid = Column(String(64), primary_key=True)
-    client_order_id = Column(String(80), nullable=False, unique=True)
-    broker_order_id = Column(String(80), nullable=True, index=True)
+    account_id = Column(String(32), nullable=False, index=True)
+
+    client_order_id = Column(String(96), nullable=False, unique=True)
+    broker_order_id = Column(String(96), nullable=True, index=True)
 
     symbol = Column(String(32), nullable=False, index=True)
     side = Column(String(8), nullable=False)
@@ -222,6 +338,7 @@ class Order(Base):
     __table_args__ = (
         CheckConstraint("qty_int >= 0", name="ck_order_qty_nonneg"),
         Index("ix_orders_state", "state"),
+        Index("ix_orders_symbol_account", "symbol", "account_id"),
     )
 
 
@@ -242,8 +359,10 @@ class OrderAnchor(Base):
     __tablename__ = "order_anchors"
 
     cid = Column(String(64), primary_key=True)
-    client_order_id = Column(String(80), nullable=False, index=True)
-    broker_order_id = Column(String(80), nullable=True, index=True)
+    account_id = Column(String(32), nullable=False, index=True)
+
+    client_order_id = Column(String(96), nullable=False, index=True)
+    broker_order_id = Column(String(96), nullable=True, index=True)
 
     request_uuid = Column(String(64), nullable=False, unique=True)
     ack_hash = Column(String(64), nullable=False)
@@ -264,7 +383,8 @@ class TradeFill(Base):
     broker_fill_id = Column(String(128), nullable=False, unique=True)
 
     cid = Column(String(64), nullable=True, index=True)
-    broker_order_id = Column(String(80), nullable=True, index=True)
+    broker_order_id = Column(String(96), nullable=True, index=True)
+    account_id = Column(String(32), nullable=True, index=True)
 
     symbol = Column(String(32), nullable=False, index=True)
     side = Column(String(8), nullable=False)
@@ -278,15 +398,12 @@ class TradeFill(Base):
 
 
 class TradeFillLink(Base):
-    """
-    Mutable mapping layer to avoid updating immutable Trade_Fills.
-    Link is created by signed reconcile decision / compensation event.
-    """
     __tablename__ = "trade_fill_links"
 
     fill_fingerprint = Column(String(64), primary_key=True)
     cid = Column(String(64), nullable=False, index=True)
-    broker_order_id = Column(String(80), nullable=True)
+    broker_order_id = Column(String(96), nullable=True)
+    account_id = Column(String(32), nullable=True, index=True)
 
     snapshot_id = Column(String(64), nullable=True, index=True)
     decision_id = Column(String(64), nullable=True, index=True)
@@ -298,8 +415,9 @@ class ReconcileSnapshot(Base):
     __tablename__ = "reconcile_snapshots"
     snapshot_id = Column(String(64), primary_key=True)
 
-    # These are required base columns (0001 creates them; later migrations may add indexes)
     symbol = Column(String(32), nullable=False, index=True)
+    account_id = Column(String(32), nullable=True, index=True)
+
     anchor_type = Column(String(32), nullable=False)
     anchor_fingerprint = Column(String(64), nullable=False, index=True)
 
@@ -316,7 +434,7 @@ class ReconcileDecision(Base):
     snapshot_id = Column(String(64), ForeignKey("reconcile_snapshots.snapshot_id"), nullable=False, index=True)
 
     decided_cid = Column(String(64), nullable=False)
-    decided_broker_order_id = Column(String(80), nullable=True)
+    decided_broker_order_id = Column(String(96), nullable=True)
 
     signer_key_id = Column(String(64), nullable=False)
     signature = Column(String(512), nullable=False)
@@ -337,15 +455,23 @@ class OutboxEvent(Base):
     status = Column(String(16), nullable=False, default="PENDING")
     attempts = Column(Integer, nullable=False, default=0)
 
+    available_at = Column(DateTime(timezone=True), nullable=False, index=True)
+
     payload = Column(JSONB, nullable=False, default=dict)
     last_error = Column(String(512), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, index=True)
     sent_at = Column(DateTime(timezone=True), nullable=True)
 
 
+# ---------------------------
+# Portfolio / research (minimal placeholders)
+# ---------------------------
+
 class PortfolioPosition(Base):
     __tablename__ = "portfolio_positions"
+    account_id = Column(String(32), primary_key=True)
     symbol = Column(String(32), primary_key=True)
+
     current_qty = Column(BigInteger, nullable=False, default=0)
     frozen_qty = Column(BigInteger, nullable=False, default=0)
     avg_price_int64 = Column(BigInteger, nullable=False, default=0)
@@ -357,6 +483,7 @@ class TradeLog(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     correlation_id = Column(String(64), nullable=False, index=True)
     cid = Column(String(64), nullable=True, index=True)
+    account_id = Column(String(32), nullable=True, index=True)
     symbol = Column(String(32), nullable=False, index=True)
     execution_state = Column(String(32), nullable=False)
     feature_snapshot = Column(JSONB, nullable=False, default=dict)
@@ -365,7 +492,9 @@ class TradeLog(Base):
 
 class T1Constraint(Base):
     __tablename__ = "t1_constraints"
+    account_id = Column(String(32), primary_key=True)
     symbol = Column(String(32), primary_key=True)
+
     locked_qty = Column(BigInteger, nullable=False, default=0)
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
@@ -407,40 +536,6 @@ class ModelSnapshot(Base):
     eval_report = Column(JSONB, nullable=False, default=dict)
     cost_model_version = Column(String(64), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False)
-
-
-class ShadowRun(Base):
-    __tablename__ = "shadow_runs"
-    run_id = Column(String(64), primary_key=True)
-    mode = Column(String(32), nullable=False)
-    old_contract_hash = Column(String(64), nullable=False)
-    new_contract_hash = Column(String(64), nullable=False)
-    summary = Column(JSONB, nullable=False, default=dict)
-    created_at = Column(DateTime(timezone=True), nullable=False)
-
-
-class SourceFidelityDaily(Base):
-    __tablename__ = "source_fidelity_daily"
-
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    symbol = Column(String(32), nullable=False, index=True)
-    data_ts = Column(DateTime(timezone=True), nullable=False, index=True)
-
-    channel_id_a = Column(String(64), nullable=False)
-    channel_id_b = Column(String(64), nullable=False)
-
-    close_a = Column(BigInteger, nullable=False)
-    close_b = Column(BigInteger, nullable=False)
-    abs_diff = Column(BigInteger, nullable=False)
-    threshold = Column(BigInteger, nullable=False)
-
-    fidelity_score_before = Column(Float, nullable=False)
-    fidelity_score_after = Column(Float, nullable=False)
-    action_taken = Column(String(32), nullable=False)
-
-    created_at = Column(DateTime(timezone=True), nullable=False)
-
-    __table_args__ = (Index("ix_fidelity_symbol_ts", "symbol", "data_ts"),)
 
 
 class GuardianKey(Base):

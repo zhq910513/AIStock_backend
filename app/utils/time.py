@@ -18,7 +18,7 @@ def to_shanghai(dt: datetime) -> datetime:
 
 def fmt_ts_millis(dt: datetime) -> str:
     dt = to_shanghai(dt)
-    return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{int(dt.microsecond/1000):03d}"
+    return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{int(dt.microsecond / 1000):03d}"
 
 
 def now_shanghai_str() -> str:

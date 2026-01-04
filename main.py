@@ -7,7 +7,7 @@ from app.database.engine import init_engine, init_schema_check
 from app.utils.time import now_shanghai_str
 
 
-app = FastAPI(title="AIStock_backend (QEE-S³)", version="1.0.0")
+app = FastAPI(title="AIStock_backend (QEE-S³/S³.1)", version="2.0.0")
 app.include_router(router)
 
 _orchestrator: Orchestrator | None = None
@@ -21,11 +21,12 @@ async def _startup() -> None:
 
     global _orchestrator, _orchestrator_task
     _orchestrator = Orchestrator()
-    _orchestrator_task = asyncio.create_task(_orchestrator.run())
+    _orchestrator_task = asyncio.create_task(_orchestrator.run(), name="orchestrator.run")
 
     # Startup audit
     from app.database.repo import Repo
     from app.database.engine import SessionLocal
+
     with SessionLocal() as s:
         Repo(s).system_events.write_event(
             event_type="SYSTEM_STARTUP",
@@ -39,11 +40,14 @@ async def _startup() -> None:
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     global _orchestrator, _orchestrator_task
+
     if _orchestrator:
         _orchestrator.stop()
+
     if _orchestrator_task:
         _orchestrator_task.cancel()
         try:
             await _orchestrator_task
         except Exception:
+            # ignore cancel/teardown errors
             pass

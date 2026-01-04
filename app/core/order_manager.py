@@ -27,13 +27,14 @@ class SubmitResult:
 
 
 class OrderManager:
-    def _client_order_id(self, cid: str) -> str:
-        return f"QEE-{cid}"
+    def _client_order_id(self, cid: str, account_id: str) -> str:
+        return f"QEE-{account_id}-{cid}"
 
     def create_order(
         self,
         s: Session,
         cid: str,
+        account_id: str,
         symbol: str,
         side: str,
         order_type: str,
@@ -54,7 +55,8 @@ class OrderManager:
         now = now_shanghai()
         order = models.Order(
             cid=cid,
-            client_order_id=self._client_order_id(cid),
+            account_id=account_id,
+            client_order_id=self._client_order_id(cid, account_id),
             broker_order_id=None,
             symbol=symbol,
             side=side.upper(),
@@ -94,12 +96,9 @@ class OrderManager:
         if transition_id is None:
             transition_id = new_transition_id(cid, from_state, to_state, int(order.version_id))
 
-        # Idempotent fast-path
         if order.state == to_state and order.last_transition_id == transition_id:
             return
 
-        # Spec atomic gate:
-        # WHERE cid=:cid AND version_id=:current_version AND last_transition_id!=:transition_id AND state=:from_state
         now = now_shanghai()
         stmt = (
             update(models.Order)
@@ -120,14 +119,12 @@ class OrderManager:
         )
         res = s.execute(stmt)
         if res.rowcount != 1:
-            # re-read to determine idempotent or conflict
             s.expire(order)
             order2 = s.get(models.Order, cid)
             if order2 and order2.state == to_state and order2.last_transition_id == transition_id:
                 return
             raise ValueError("State transition conflict (optimistic lock / idempotency gate)")
 
-        # record transition event (best-effort; unique constraint keeps idempotent)
         try:
             s.add(
                 models.OrderTransition(
@@ -141,8 +138,6 @@ class OrderManager:
             s.flush()
         except IntegrityError:
             s.rollback()
-            # Ensure order update isn't lost: reopen transaction expectation is caller-managed.
-            # For single-writer usage, IntegrityError only happens on duplicate transition_id insert.
             pass
 
         repo.system_events.write_event(
@@ -161,17 +156,17 @@ class OrderManager:
 
         self.transition(s, cid, "CREATED", "SUBMITTED")
 
-        dedupe_key = f"SEND_ORDER:{cid}"
+        dedupe_key = f"SEND_ORDER:{order.account_id}:{cid}"
         repo.outbox.enqueue(
             event_type="SEND_ORDER",
             dedupe_key=dedupe_key,
-            payload={"cid": cid},
+            payload={"cid": cid, "account_id": order.account_id},
         )
         repo.system_events.write_event(
             event_type="OUTBOX_ENQUEUED",
             correlation_id=cid,
             severity="INFO",
             symbol=order.symbol,
-            payload={"event_type": "SEND_ORDER", "dedupe_key": dedupe_key},
+            payload={"event_type": "SEND_ORDER", "dedupe_key": dedupe_key, "account_id": order.account_id},
         )
         return SubmitResult(cid=cid, client_order_id=order.client_order_id, state="SUBMITTED")

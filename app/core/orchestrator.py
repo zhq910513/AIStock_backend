@@ -8,13 +8,12 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.adapters.ths_adapter import get_ths_adapter
-from app.core.reasoning import ReasoningEngine
+from app.core.agent_loop import AgentLoop
 from app.core.guard import Guard
 from app.core.order_manager import OrderManager
 from app.core.reconciler import Reconciler
-from app.core.source_fidelity import SourceFidelityEngine
-from app.core.differential_audit import DifferentialAuditEngine
-from app.core.outbox import OutboxDispatcher, BrokerSendResult
+from app.core.outbox import OutboxDispatcher
+from app.core.execution_router import ExecutionRouter
 from app.database.engine import SessionLocal
 from app.database.repo import Repo
 from app.database import models
@@ -24,30 +23,20 @@ from app.utils.crypto import sha256_hex
 from app.utils.p2 import P2Quantile
 
 
-class MockBrokerSender:
-    def send_order(self, raw_req: dict) -> BrokerSendResult:
-        cid = raw_req["cid"]
-        broker_order_id = f"B-{cid[:12]}"
-        raw_response = {"ok": True, "broker_order_id": broker_order_id, "echo": raw_req["request_uuid"]}
-        return BrokerSendResult(broker_order_id=broker_order_id, raw_response=raw_response)
-
-
 @dataclass
 class Orchestrator:
     running: bool = True
 
     def __post_init__(self) -> None:
         self.adapter = get_ths_adapter()
-        self.reasoning = ReasoningEngine()
+        self.agent = AgentLoop()
         self.guard = Guard()
         self.order_manager = OrderManager()
         self.reconciler = Reconciler()
-        self.fidelity = SourceFidelityEngine()
-        self.diff_audit = DifferentialAuditEngine()
+        self.exec_router = ExecutionRouter()
+        self.outbox_dispatcher = OutboxDispatcher(router=self.exec_router)
 
         self.symbols = [x.strip() for x in settings.ORCH_SYMBOLS.split(",") if x.strip()]
-        self.outbox_dispatcher = OutboxDispatcher(broker_sender=MockBrokerSender())
-
         self._last_tick_ts = None
 
     def stop(self) -> None:
@@ -91,9 +80,10 @@ class Orchestrator:
                     s0.commit()
             self._last_tick_ts = tick_now
 
-        # 1) ingest/decision/order enqueue
+        # 1) ingest + agentic decision + enqueue orders
         with SessionLocal() as s:
             repo = Repo(s)
+            repo.accounts.ensure_accounts_seeded()
 
             # 9.1 Frozen daily versions
             try:
@@ -117,7 +107,7 @@ class Orchestrator:
                 return
 
             for sym in self.symbols:
-                if repo.symbol_lock.is_locked(sym):
+                if repo.symbol_lock.is_locked(sym, account_id="GLOBAL"):
                     repo.system_events.write_event(
                         event_type="SYMBOL_LOCKED_SKIP",
                         correlation_id=None,
@@ -130,18 +120,44 @@ class Orchestrator:
                 ev = self.adapter.fetch_market_event(sym)
                 raw_row = self._ingest_event_with_sequencer(s, ev)
 
-                features = {"price": float(ev["payload"].get("price", 0.0))}
-                out = self.reasoning.infer(features)
+                # correlation_id for this tick+symbol decision chain
+                corr = sha256_hex(f"{sym}|{raw_row.payload_sha256}|{tick_now.isoformat()}".encode("utf-8"))[:32]
 
-                # decision bundle id deterministic
-                decision_id = sha256_hex(f"{sym}|{raw_row.payload_sha256}|{out.reason_code}".encode("utf-8"))
+                # route account early (multi-account)
+                route = self.exec_router.route(s, sym)
+                account_id = route.account_id
+
+                agent_dec = self.agent.run_for_symbol(s, sym, account_id=account_id, correlation_id=corr)
+
+                decision_id = sha256_hex(
+                    f"{sym}|{raw_row.payload_sha256}|{agent_dec.feature_hash}|{agent_dec.reason_code}|{agent_dec.decision}".encode("utf-8")
+                )
+
+                # rewrite validation record with final decision_id (immutability via new record)
+                val_id = repo.validations.write(
+                    decision_id=decision_id,
+                    symbol=sym,
+                    hypothesis=str(agent_dec.params.get("hypothesis", "")),
+                    request_ids=agent_dec.request_ids,
+                    evidence={"features_hash": agent_dec.feature_hash, "params": agent_dec.params},
+                    conclusion=str(agent_dec.params.get("validation_conclusion", "INCONCLUSIVE")),
+                    score=float(agent_dec.confidence),
+                )
+
                 s.add(
                     models.DecisionBundle(
                         decision_id=decision_id,
                         cid=None,
-                        decision=out.decision,
-                        reason_code=out.reason_code,
-                        params=out.params,
+                        account_id=account_id,
+                        symbol=sym,
+                        decision=agent_dec.decision,
+                        reason_code=agent_dec.reason_code,
+                        params=agent_dec.params,
+                        request_ids=agent_dec.request_ids,
+                        model_hash=agent_dec.model_hash,
+                        feature_hash=agent_dec.feature_hash,
+                        seed_set_hash="",
+                        rng_seed_hash="",
                         guard_status={},
                         data_quality={
                             "data_status": raw_row.data_status,
@@ -175,49 +191,50 @@ class Orchestrator:
                             feature_extractor_version=settings.FEATURE_EXTRACTOR_VERSION,
                             rule_set_version_hash=settings.RULESET_VERSION_HASH,
                             strategy_contract_hash=settings.STRATEGY_CONTRACT_HASH,
-                            features=features,
+                            features={"price": float(raw_row.payload.get("price", 0.0))},
                             created_at=now_shanghai(),
                         )
                     )
 
-                if out.decision in {"BUY", "SELL"}:
+                if agent_dec.decision in {"BUY", "SELL"}:
                     if not self._trade_gate_ok(repo):
                         repo.system_events.write_event(
                             event_type="TRADE_GATE_BLOCKED",
-                            correlation_id=None,
+                            correlation_id=corr,
                             severity="WARN",
                             symbol=sym,
                             payload={"reason": "guard_or_self_check"},
                         )
                         continue
 
-                    # signal time is decision time input (deterministic)
                     signal_dt = now_shanghai()
                     td = trading_day_str(signal_dt)
                     signal_ts_millis = fmt_ts_millis(signal_dt)
 
-                    nonce = repo.nonce.next_nonce(sym, "PRIMARY")
+                    nonce = repo.nonce.next_nonce(sym, "PRIMARY", account_id=account_id)
                     cid = make_cid(
                         trading_day=td,
                         symbol=sym,
                         strategy_id="PRIMARY",
                         signal_ts_millis=signal_ts_millis,
                         nonce=nonce,
-                        side=out.decision,
+                        side=agent_dec.decision,
                         intended_qty_or_notional=100,
+                        account_id=account_id,
                     )
 
                     s.add(
                         models.Signal(
                             cid=cid,
+                            account_id=account_id,
                             trading_day=td,
                             symbol=sym,
                             strategy_id="PRIMARY",
                             signal_ts=signal_dt,
                             nonce=nonce,
-                            side=out.decision,
+                            side=agent_dec.decision,
                             intended_qty_or_notional=100,
-                            confidence=out.confidence,
+                            confidence=agent_dec.confidence,
                             rule_set_version_hash=settings.RULESET_VERSION_HASH,
                             strategy_contract_hash=settings.STRATEGY_CONTRACT_HASH,
                             model_snapshot_uuid=settings.MODEL_SNAPSHOT_UUID,
@@ -228,28 +245,36 @@ class Orchestrator:
                         )
                     )
 
-                    gr = self.guard.evaluate(s, sym, out.decision, intended_qty=100)
+                    gr = self.guard.evaluate(s, sym, agent_dec.decision, intended_qty=100, account_id=account_id)
                     if gr.veto:
                         repo.system_events.write_event(
                             event_type="GUARD_VETO",
                             correlation_id=cid,
                             severity="WARN",
                             symbol=sym,
-                            payload={"guard_level": gr.guard_level, "veto_code": gr.veto_code},
+                            payload={"guard_level": gr.guard_level, "veto_code": gr.veto_code, "account_id": account_id},
                         )
                         continue
 
                     self.order_manager.create_order(
                         s=s,
                         cid=cid,
+                        account_id=account_id,
                         symbol=sym,
-                        side=out.decision,
+                        side=agent_dec.decision,
                         order_type="LIMIT",
                         limit_price=float(raw_row.payload.get("price", 0.0)),
                         qty=100,
                         strategy_contract_hash=settings.STRATEGY_CONTRACT_HASH,
                     )
                     self.order_manager.submit(s, cid)
+
+                    # bind decision->cid (best-effort)
+                    s.execute(
+                        models.DecisionBundle.__table__.update()
+                        .where(models.DecisionBundle.decision_id == decision_id)
+                        .values(cid=cid)
+                    )
 
             s.commit()
 
@@ -261,12 +286,8 @@ class Orchestrator:
             else:
                 s2.rollback()
 
-        # 3) reconcile fills (mock)
-        with SessionLocal() as s3:
-            fills = self.adapter.query_fills()
-            if fills:
-                self.reconciler.upsert_fills_first(s3, fills)
-                s3.commit()
+        # 3) reconcile fills (mock broker returns empty)
+        # left as execution-plane poller in future
 
     def _ingest_event_with_sequencer(self, s: Session, ev: dict) -> models.RawMarketEvent:
         repo = Repo(s)
@@ -343,7 +364,13 @@ class Orchestrator:
                 correlation_id=row.request_id,
                 severity="WARN",
                 symbol=row.symbol,
-                payload={"reason": "Channel_Jitter", "channel_id": channel_id, "seq": seq, "last_seq": int(cur.last_seq), "epsilon_ms": epsilon_ms},
+                payload={
+                    "reason": "Channel_Jitter",
+                    "channel_id": channel_id,
+                    "seq": seq,
+                    "last_seq": int(cur.last_seq),
+                    "epsilon_ms": epsilon_ms,
+                },
             )
         else:
             cur.last_seq = seq

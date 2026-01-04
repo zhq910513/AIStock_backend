@@ -5,7 +5,6 @@ from sqlalchemy.orm import sessionmaker
 
 from app.config import settings
 
-
 _engine = None
 SessionLocal = None
 
@@ -31,9 +30,15 @@ def get_engine():
 
 def init_schema_check() -> None:
     """
-    Production safety: ensure timezone behavior and basic connectivity.
+    Since we are redesigning without alembic migrations, we treat schema as fresh:
+    - verify connectivity
+    - ensure timezone behavior
+    - create tables if missing (create_all is safe on empty DB)
     """
     eng = get_engine()
     with eng.connect() as conn:
         conn.execute(text("SELECT 1"))
         conn.commit()
+
+    from app.database.models import Base
+    Base.metadata.create_all(bind=eng)

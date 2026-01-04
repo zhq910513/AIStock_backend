@@ -23,7 +23,6 @@ class CanonicalizedOrder:
 
 
 def _int64_be(x: int) -> bytes:
-    # signed int64 big-endian
     return int(x).to_bytes(8, byteorder="big", signed=True)
 
 
@@ -57,7 +56,6 @@ def _enum_order_type(order_type: str) -> int:
 def _tick_discretize(price: float, tick_size: float) -> float:
     if tick_size <= 0:
         return price
-    # nearest tick (ties to nearest)
     n = round(price / tick_size)
     return n * tick_size
 
@@ -73,7 +71,6 @@ def _lot_discretize(qty: int, lot_size: int) -> int:
 def _ensure_instrument_rules(s: Session, symbol: str) -> models.InstrumentRuleCache:
     rule = s.get(models.InstrumentRuleCache, symbol)
     if rule is None:
-        # dev seed
         from app.utils.time import now_shanghai
         rule = models.InstrumentRuleCache(
             symbol=symbol,
@@ -97,13 +94,6 @@ def canonicalize_order(
     limit_price: Optional[float],
     qty: int,
 ) -> CanonicalizedOrder:
-    """
-    QEE-S³ 4.4: Canonicalization Protocol
-    - tick/lot rule bound into hash
-    - price->Int64 = round(discretized_price*10000)
-    - market order: limit_price_int64 = 0 (participates in hash)
-    - metadata_hash = SHA256(Serialize(...)) with canonicalization_version
-    """
     rule = _ensure_instrument_rules(s, symbol)
 
     tick_size = float(rule.tick_size)
@@ -119,9 +109,6 @@ def canonicalize_order(
 
     qty_int = int(_lot_discretize(int(qty), lot_size))
 
-    # Serialize (versioned)
-    # canon_v1 :=  [u32 len(version)+version][u32 len(cid)+cid][u32 orderTypeEnum][i64 price][i64 qty][u32 sideEnum]
-    #              [u32 len(tickRuleVer)+...][u32 len(lotRuleVer)+...]
     b = b"".join(
         [
             _bstr(settings.CANONICALIZATION_VERSION),

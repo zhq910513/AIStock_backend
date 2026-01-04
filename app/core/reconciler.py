@@ -69,6 +69,7 @@ class Reconciler:
 
             cid = f.get("cid")
             broker_order_id = f.get("broker_order_id")
+            account_id = f.get("account_id")
 
             # 1) direct mapping by broker_order_id
             if cid is None and broker_order_id:
@@ -79,15 +80,17 @@ class Reconciler:
                 )
                 if len(candidates) == 1:
                     cid = candidates[0].cid
+                    account_id = candidates[0].account_id
                 elif len(candidates) > 1:
                     snapshot_id = self._create_ambiguous_snapshot(
                         s=s,
                         symbol=symbol,
+                        account_id=None,
                         anchor_type="AMBIGUOUS_BROKER_ORDER_ID",
                         anchor_fingerprint=fp,
-                        candidates=[{"cid": o.cid, "broker_order_id": o.broker_order_id, "score": 1.0, "reason": "same_broker_order_id"} for o in candidates],
+                        candidates=[{"cid": o.cid, "broker_order_id": o.broker_order_id, "account_id": o.account_id, "score": 1.0, "reason": "same_broker_order_id"} for o in candidates],
                     )
-                    repo.symbol_lock.lock(symbol, "AMBIGUOUS", snapshot_id)
+                    repo.symbol_lock.lock(symbol, "AMBIGUOUS", snapshot_id, account_id="GLOBAL")
                     ambiguous += 1
 
             # 2) fallback: symbol+side candidate (heuristic)
@@ -105,24 +108,30 @@ class Reconciler:
                 )
                 if len(cand) == 1:
                     cid = cand[0].cid
+                    account_id = cand[0].account_id
                 elif len(cand) > 1:
                     snapshot_id = self._create_ambiguous_snapshot(
                         s=s,
                         symbol=symbol,
+                        account_id=None,
                         anchor_type="AMBIGUOUS_MATCH",
                         anchor_fingerprint=fp,
-                        candidates=[{"cid": o.cid, "broker_order_id": o.broker_order_id, "score": 0.5, "reason": "symbol_side_window"} for o in cand],
+                        candidates=[{"cid": o.cid, "broker_order_id": o.broker_order_id, "account_id": o.account_id, "score": 0.5, "reason": "symbol_side_window"} for o in cand],
                     )
-                    repo.symbol_lock.lock(symbol, "AMBIGUOUS", snapshot_id)
+                    repo.symbol_lock.lock(symbol, "AMBIGUOUS", snapshot_id, account_id="GLOBAL")
                     ambiguous += 1
 
-                    # mark each candidate as AMBIGUOUS via state machine
                     for o in cand:
                         if o.state != "AMBIGUOUS":
                             try:
-                                self.om.transition(s, o.cid, o.state, "AMBIGUOUS", transition_id=sha256_hex(f"AMBIGUOUS|{snapshot_id}|{o.cid}".encode("utf-8"))[:32])
+                                self.om.transition(
+                                    s,
+                                    o.cid,
+                                    o.state,
+                                    "AMBIGUOUS",
+                                    transition_id=sha256_hex(f"AMBIGUOUS|{snapshot_id}|{o.cid}".encode("utf-8"))[:32],
+                                )
                             except Exception:
-                                # if state moved, keep conservative: symbol lock already stops automation
                                 pass
 
                     repo.system_events.write_event(
@@ -137,6 +146,7 @@ class Reconciler:
                 broker_fill_id=broker_fill_id,
                 cid=cid,
                 broker_order_id=broker_order_id,
+                account_id=account_id,
                 symbol=symbol,
                 side=side,
                 fill_price_int64=price_int64,
@@ -148,7 +158,6 @@ class Reconciler:
             s.add(tf)
             upserted += 1
 
-            # ORPHAN_FILL (S³.1)
             if cid is None and broker_order_id is None:
                 orphan += 1
                 repo.system_events.write_event(
@@ -157,7 +166,7 @@ class Reconciler:
                     severity="CRITICAL",
                     symbol=symbol,
                     payload={
-                        "account_id": f.get("account_id", "unknown"),
+                        "account_id": account_id or "unknown",
                         "fill_fingerprint": fp,
                         "fill_detail": {"symbol": symbol, "side": side, "price": price_int64, "qty": qty_int, "fill_ts": fill_ts.isoformat()},
                         "missing_links": {
@@ -179,12 +188,13 @@ class Reconciler:
         self,
         s: Session,
         symbol: str,
+        account_id: str | None,
         anchor_type: str,
         anchor_fingerprint: str,
         candidates: list[dict[str, Any]],
     ) -> str:
         repo = Repo(s)
-        snap_material = f"{anchor_type}|{anchor_fingerprint}|{symbol}|{candidates}"
+        snap_material = f"{anchor_type}|{anchor_fingerprint}|{symbol}|{account_id or ''}|{candidates}"
         snapshot_id = sha256_hex(snap_material.encode("utf-8"))
         report_hash = sha256_hex(snap_material.encode("utf-8"))
 
@@ -194,6 +204,7 @@ class Reconciler:
                 models.ReconcileSnapshot(
                     snapshot_id=snapshot_id,
                     symbol=symbol,
+                    account_id=account_id,
                     anchor_type=anchor_type,
                     anchor_fingerprint=anchor_fingerprint,
                     candidates=candidates,
@@ -216,7 +227,6 @@ class Reconciler:
         repo = Repo(s)
         orders = s.execute(select(models.Order)).scalars().all()
 
-        # preload fill links
         links = s.execute(select(models.TradeFillLink)).scalars().all()
         fp_to_cid = {x.fill_fingerprint: x.cid for x in links}
 
@@ -237,7 +247,13 @@ class Reconciler:
             if filled_qty >= int(o.qty_int):
                 if o.state != "FILLED":
                     try:
-                        self.om.transition(s, o.cid, o.state, "FILLED", transition_id=sha256_hex(f"DERIVE_FILLED|{o.cid}|{filled_qty}".encode("utf-8"))[:32])
+                        self.om.transition(
+                            s,
+                            o.cid,
+                            o.state,
+                            "FILLED",
+                            transition_id=sha256_hex(f"DERIVE_FILLED|{o.cid}|{filled_qty}".encode("utf-8"))[:32],
+                        )
                     except Exception:
                         pass
                     repo.system_events.write_event(
@@ -250,7 +266,13 @@ class Reconciler:
             elif filled_qty > 0:
                 if o.state not in {"PARTIALLY_FILLED", "FILLED"}:
                     try:
-                        self.om.transition(s, o.cid, o.state, "PARTIALLY_FILLED", transition_id=sha256_hex(f"DERIVE_PARTIAL|{o.cid}|{filled_qty}".encode("utf-8"))[:32])
+                        self.om.transition(
+                            s,
+                            o.cid,
+                            o.state,
+                            "PARTIALLY_FILLED",
+                            transition_id=sha256_hex(f"DERIVE_PARTIAL|{o.cid}|{filled_qty}".encode("utf-8"))[:32],
+                        )
                     except Exception:
                         pass
                     repo.system_events.write_event(
@@ -261,9 +283,6 @@ class Reconciler:
                         payload={"cid": o.cid, "filled_qty": filled_qty, "qty_int": int(o.qty_int)},
                     )
 
-    # ---------------------------
-    # Signed decision apply path (RECONCILE_DECISION + COMPENSATION)
-    # ---------------------------
     def apply_reconcile_decision_signed(
         self,
         s: Session,
@@ -300,7 +319,6 @@ class Reconciler:
         decision_material = sha256_hex(f"{msg}|{signer_key_id}|{signature_b64}|{prev_decision_id or ''}".encode("utf-8"))
         decision_id = decision_material[:64]
 
-        # write reconcile decision record (the authoritative signed event)
         s.add(
             models.ReconcileDecision(
                 decision_id=decision_id,
@@ -314,13 +332,10 @@ class Reconciler:
             )
         )
 
-        # mark snapshot decided
         snap.status = "DECIDED"
 
-        # unlock symbol chain now that decision is applied
-        repo.symbol_lock.unlock(snap.symbol)
+        repo.symbol_lock.unlock(snap.symbol, account_id="GLOBAL")
 
-        # apply deterministic mapping
         order = s.get(models.Order, decided_cid)
         if order is None:
             raise ValueError("order_not_found")
@@ -331,12 +346,16 @@ class Reconciler:
 
         if order.state in {"AMBIGUOUS", "SUBMITTED", "CREATED"}:
             try:
-                self.om.transition(s, decided_cid, order.state, "PENDING", transition_id=sha256_hex(f"RECONCILE_DECISION_APPLY|{decision_id}".encode("utf-8"))[:32])
+                self.om.transition(
+                    s,
+                    decided_cid,
+                    order.state,
+                    "PENDING",
+                    transition_id=sha256_hex(f"RECONCILE_DECISION_APPLY|{decision_id}".encode("utf-8"))[:32],
+                )
             except Exception:
                 pass
 
-        # IMPORTANT: never update immutable trade_fills; write a link row instead
-        # Only link fills that match the snapshot anchor_fingerprint (tight binding)
         tf = s.execute(select(models.TradeFill).where(models.TradeFill.fill_fingerprint == snap.anchor_fingerprint)).scalar_one_or_none()
         if tf is not None:
             exists_link = s.get(models.TradeFillLink, tf.fill_fingerprint)
@@ -346,6 +365,7 @@ class Reconciler:
                         fill_fingerprint=tf.fill_fingerprint,
                         cid=decided_cid,
                         broker_order_id=decided_broker_order_id,
+                        account_id=order.account_id,
                         snapshot_id=snapshot_id,
                         decision_id=decision_id,
                         created_at=now_shanghai(),

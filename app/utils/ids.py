@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from app.utils.crypto import sha256_hex
-from app.utils.time import fmt_ts_millis, trading_day_str, to_shanghai
-from datetime import datetime
 
 
 def deterministic_id(prefix: str, material: str) -> str:
@@ -28,11 +26,15 @@ def make_cid(
     nonce: int,
     side: str,
     intended_qty_or_notional: int,
+    account_id: str,
 ) -> str:
     """
-    QEE-S³ 4.2
-    CID = Hash(TradingDay, Symbol, StrategyID, SignalTS, Nonce, Side, IntendedQtyOrNotional)
+    QEE-S³ 4.2 (extended for multi-account)
+    CID = Hash(TradingDay, Symbol, StrategyID, SignalTS, Nonce, Side, IntendedQtyOrNotional, AccountId)
     - signal_ts_millis must be provided from decision time (not generated inside).
     """
-    canonical = f"{trading_day}|{symbol}|{strategy_id}|{signal_ts_millis}|{int(nonce)}|{side.upper()}|{int(intended_qty_or_notional)}"
+    canonical = (
+        f"{trading_day}|{symbol}|{strategy_id}|{signal_ts_millis}|{int(nonce)}|"
+        f"{side.upper()}|{int(intended_qty_or_notional)}|{account_id}"
+    )
     return sha256_hex(canonical.encode("utf-8"))

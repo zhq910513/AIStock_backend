@@ -32,16 +32,15 @@ class MockTHSAdapter:
         payload = {"symbol": symbol, "price": 10.0, "ts": ingest_ts.isoformat()}
         payload_bytes = str(payload).encode("utf-8")
 
-        # deterministic request id: source|symbol|ingest_ts
-        req_id = new_request_id(f"{settings.THS_MODE}|{symbol}|{ingest_ts.isoformat()}")
+        req_id = new_request_id(f"{settings.DATA_PROVIDER}|{symbol}|{ingest_ts.isoformat()}")
 
         indicator_set = "PRICE"
         params_canonical = f"symbol={symbol}"
 
         return {
-            "api_schema_version": "1",
-            "source": settings.THS_MODE,
-            "ths_product": settings.THS_MODE,
+            "api_schema_version": settings.API_SCHEMA_VERSION,
+            "source": settings.DATA_PROVIDER,
+            "ths_product": settings.DATA_PROVIDER,
             "ths_function": "MOCK_PRICE",
             "ths_indicator_set": indicator_set,
             "ths_params_canonical": params_canonical,
@@ -49,7 +48,7 @@ class MockTHSAdapter:
             "ths_quota_context": "mock",
 
             "source_clock_quality": "AGGREGATED",
-            "channel_id": f"{settings.THS_MODE}:{symbol}",
+            "channel_id": f"{settings.DATA_PROVIDER}:{symbol}",
             "channel_seq": int(ingest_ts.timestamp() * 1000),
             "symbol": symbol,
 

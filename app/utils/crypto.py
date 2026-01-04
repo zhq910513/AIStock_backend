@@ -11,6 +11,7 @@ def sha256_hex(data: bytes) -> str:
 
 def verify_ed25519_signature(public_key_b64: str, message: bytes, signature_b64: str) -> bool:
     import base64
+
     try:
         pk = base64.b64decode(public_key_b64)
         sig = base64.b64decode(signature_b64)
