@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -14,6 +15,7 @@ from app.core.order_manager import OrderManager
 from app.core.reconciler import Reconciler
 from app.core.outbox import OutboxDispatcher
 from app.core.execution_router import ExecutionRouter
+from app.core.exit_monitor import ExitMonitor
 from app.database.engine import SessionLocal
 from app.database.repo import Repo
 from app.database import models
@@ -34,6 +36,7 @@ class Orchestrator:
         self.order_manager = OrderManager()
         self.reconciler = Reconciler()
         self.exec_router = ExecutionRouter()
+        self.exit_monitor = ExitMonitor()
         self.outbox_dispatcher = OutboxDispatcher(router=self.exec_router)
 
         self.symbols = [x.strip() for x in settings.ORCH_SYMBOLS.split(",") if x.strip()]
@@ -286,8 +289,208 @@ class Orchestrator:
             else:
                 s2.rollback()
 
-        # 3) reconcile fills (mock broker returns empty)
-        # left as execution-plane poller in future
+        # 3) poll broker fills -> reconcile -> update portfolio positions
+        with SessionLocal() as s3:
+            self.exec_router.ensure_brokers(s3)
+            total_fills = 0
+            for account_id, broker in self.exec_router.list_brokers(s3):
+                fills = broker.query_fills()
+                if not fills:
+                    continue
+                total_fills += len(fills)
+                self.reconciler.upsert_fills_first(s3, fills)
+
+            if total_fills:
+                Repo(s3).system_events.write_event(
+                    event_type="BROKER_FILLS_INGESTED",
+                    correlation_id=None,
+                    severity="INFO",
+                    payload={"fills": int(total_fills)},
+                )
+                s3.commit()
+            else:
+                s3.rollback()
+
+        # 4) exit monitor: scan open positions -> enqueue SELL when policy triggers
+        with SessionLocal() as s4:
+            repo4 = Repo(s4)
+            repo4.accounts.ensure_accounts_seeded()
+
+            open_positions = (
+                s4.execute(select(models.PortfolioPosition).where(models.PortfolioPosition.current_qty > 0))
+                .scalars()
+                .all()
+            )
+            if not open_positions:
+                s4.rollback()
+                return
+
+            for pos in open_positions:
+                account_id = str(pos.account_id)
+                symbol = str(pos.symbol)
+                qty = int(pos.current_qty)
+                if qty <= 0:
+                    continue
+
+                # prevent duplicate exit orders
+                existing = (
+                    s4.execute(
+                        select(models.Order)
+                        .where(
+                            models.Order.account_id == account_id,
+                            models.Order.symbol == symbol,
+                            models.Order.side == "SELL",
+                            models.Order.state.in_(["CREATED", "SUBMITTED", "PENDING", "PARTIALLY_FILLED"]),
+                        )
+                        .limit(1)
+                    )
+                    .scalars()
+                    .first()
+                )
+                if existing is not None:
+                    continue
+
+                dec = self.exit_monitor.evaluate(s4, account_id=account_id, symbol=symbol)
+                if dec.decision != "SELL":
+                    continue
+
+                if not self._trade_gate_ok(repo4):
+                    repo4.system_events.write_event(
+                        event_type="EXIT_TRADE_GATE_BLOCKED",
+                        correlation_id=None,
+                        severity="WARN",
+                        symbol=symbol,
+                        payload={"account_id": account_id, "reason_code": dec.reason_code},
+                    )
+                    continue
+
+                # Sell signal/order (CID is idempotency key)
+                signal_dt = now_shanghai()
+                td = trading_day_str(signal_dt)
+                signal_ts_millis = fmt_ts_millis(signal_dt)
+                nonce = repo4.nonce.next_nonce(symbol, "EXIT", account_id=account_id)
+
+                cid = make_cid(
+                    trading_day=td,
+                    symbol=symbol,
+                    strategy_id="EXIT",
+                    signal_ts_millis=signal_ts_millis,
+                    nonce=nonce,
+                    side="SELL",
+                    intended_qty_or_notional=qty,
+                    account_id=account_id,
+                )
+
+                # validation record tied to cid
+                repo4.validations.write(
+                    decision_id=cid,
+                    symbol=symbol,
+                    hypothesis=f"ExitPolicy({dec.params.get('policy', {}).get('policy_hash', '')})",
+                    request_ids=list(dec.params.get("request_ids", []) or []),
+                    evidence=dec.params,
+                    conclusion="PASS" if dec.confidence >= 0.8 else "INCONCLUSIVE",
+                    score=float(dec.confidence),
+                )
+
+                # best-effort lineage: latest market payload hash
+                last_ev = (
+                    s4.execute(
+                        select(models.RawMarketEvent)
+                        .where(models.RawMarketEvent.symbol == symbol)
+                        .order_by(models.RawMarketEvent.data_ts.desc())
+                        .limit(1)
+                    )
+                    .scalars()
+                    .first()
+                )
+                lineage_ref = str((dec.params.get("features", {}) or {}).get("last_market_payload_sha256", ""))
+
+                s4.add(
+                    models.DecisionBundle(
+                        decision_id=cid,
+                        cid=cid,
+                        account_id=account_id,
+                        symbol=symbol,
+                        decision="SELL",
+                        reason_code=dec.reason_code,
+                        params=dec.params,
+                        request_ids=list(dec.params.get("request_ids", []) or []),
+                        model_hash=str(dec.params.get("policy", {}).get("policy_hash", "") or ""),
+                        feature_hash=str(dec.params.get("feature_hash", "") or ""),
+                        seed_set_hash="",
+                        rng_seed_hash="",
+                        guard_status={},
+                        data_quality={},
+                        rule_set_version_hash=settings.RULESET_VERSION_HASH,
+                        model_snapshot_uuid=settings.MODEL_SNAPSHOT_UUID,
+                        strategy_contract_hash=settings.STRATEGY_CONTRACT_HASH,
+                        feature_extractor_version=settings.FEATURE_EXTRACTOR_VERSION,
+                        cost_model_version=settings.COST_MODEL_VERSION,
+                        lineage_ref=lineage_ref,
+                        created_at=now_shanghai(),
+                    )
+                )
+
+                s4.add(
+                    models.Signal(
+                        cid=cid,
+                        account_id=account_id,
+                        trading_day=td,
+                        symbol=symbol,
+                        strategy_id="EXIT",
+                        signal_ts=signal_dt,
+                        nonce=nonce,
+                        side="SELL",
+                        intended_qty_or_notional=qty,
+                        confidence=float(dec.confidence),
+                        rule_set_version_hash=settings.RULESET_VERSION_HASH,
+                        strategy_contract_hash=settings.STRATEGY_CONTRACT_HASH,
+                        model_snapshot_uuid=settings.MODEL_SNAPSHOT_UUID,
+                        cost_model_version=settings.COST_MODEL_VERSION,
+                        feature_extractor_version=settings.FEATURE_EXTRACTOR_VERSION,
+                        lineage_ref=lineage_ref,
+                        created_at=now_shanghai(),
+                    )
+                )
+
+                # use latest price as limit
+                last_price = float((dec.params.get("features", {}) or {}).get("last_price", 0.0))
+                if last_price <= 0:
+                    last_price = 0.0
+
+                gr = self.guard.evaluate(s4, symbol, "SELL", intended_qty=qty, account_id=account_id)
+                if gr.veto:
+                    repo4.system_events.write_event(
+                        event_type="EXIT_GUARD_VETO",
+                        correlation_id=cid,
+                        severity="WARN",
+                        symbol=symbol,
+                        payload={"account_id": account_id, "guard_level": gr.guard_level, "veto_code": gr.veto_code},
+                    )
+                    continue
+
+                self.order_manager.create_order(
+                    s=s4,
+                    cid=cid,
+                    account_id=account_id,
+                    symbol=symbol,
+                    side="SELL",
+                    order_type="LIMIT",
+                    limit_price=last_price if last_price > 0 else None,
+                    qty=qty,
+                    strategy_contract_hash=settings.STRATEGY_CONTRACT_HASH,
+                )
+                self.order_manager.submit(s4, cid)
+
+                repo4.system_events.write_event(
+                    event_type="EXIT_ORDER_ENQUEUED",
+                    correlation_id=cid,
+                    severity="INFO",
+                    symbol=symbol,
+                    payload={"account_id": account_id, "qty": qty, "reason_code": dec.reason_code},
+                )
+
+            s4.commit()
 
     def _ingest_event_with_sequencer(self, s: Session, ev: dict) -> models.RawMarketEvent:
         repo = Repo(s)

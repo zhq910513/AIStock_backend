@@ -325,6 +325,48 @@ class FrozenVersionsRepo:
 
 
 @dataclass
+class StrategyContractsRepo:
+    s: Session
+
+    def ensure_seeded(self, strategy_contract_hash: str) -> None:
+        row = self.s.get(models.StrategyContract, strategy_contract_hash)
+        if row is not None:
+            return
+
+        # Minimal default contract derived from settings (can be replaced by writing a new row with a new hash)
+        definition = {
+            "version": 1,
+            "objective": {
+                "hold_days_min": int(settings.HOLD_DAYS_MIN),
+                "hold_days_max": int(settings.HOLD_DAYS_MAX),
+                "target_return_min": float(settings.TARGET_RETURN_MIN),
+                "target_return_max": float(settings.TARGET_RETURN_MAX),
+            },
+            "exit_policy": {
+                "hold_days_min": int(settings.HOLD_DAYS_MIN),
+                "hold_days_max": int(settings.HOLD_DAYS_MAX),
+                "tp_min": float(settings.TARGET_RETURN_MIN),
+                "tp_max": float(settings.TARGET_RETURN_MAX),
+                "sl_pct": 0.03,
+            },
+        }
+        self.s.add(
+            models.StrategyContract(
+                strategy_contract_hash=strategy_contract_hash,
+                definition=definition,
+                created_at=now_shanghai(),
+            )
+        )
+        self.s.flush()
+
+    def get_definition(self, strategy_contract_hash: str) -> dict:
+        row = self.s.get(models.StrategyContract, strategy_contract_hash)
+        if row is None:
+            self.ensure_seeded(strategy_contract_hash)
+            row = self.s.get(models.StrategyContract, strategy_contract_hash)
+        return dict(row.definition or {}) if row is not None else {}
+
+@dataclass
 class DataRequestsRepo:
     s: Session
 
@@ -508,6 +550,11 @@ class Repo:
     @property
     def anchors(self) -> OrderAnchorRepo:
         return OrderAnchorRepo(self.s)
+
+    @property
+    def strategy_contracts(self) -> StrategyContractsRepo:
+        return StrategyContractsRepo(self.s)
+
 
     @property
     def frozen_versions(self) -> FrozenVersionsRepo:

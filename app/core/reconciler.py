@@ -158,6 +158,16 @@ class Reconciler:
             s.add(tf)
             upserted += 1
 
+            # Maintain mutable portfolio projection (append-only inputs remain intact)
+            self._apply_fill_to_position(
+                s,
+                account_id=str(f.get("account_id") or ""),
+                symbol=symbol,
+                side=side,
+                price_int64=price_int64,
+                qty_int=qty_int,
+            )
+
             if cid is None and broker_order_id is None:
                 orphan += 1
                 repo.system_events.write_event(
@@ -183,6 +193,91 @@ class Reconciler:
 
         self._derive_order_states_from_fills(s)
         return ReconcileResult(fills_upserted=upserted, orphan_fills=orphan, ambiguous_snapshots=ambiguous)
+
+    def _apply_fill_to_position(
+        self,
+        s: Session,
+        *,
+        account_id: str,
+        symbol: str,
+        side: str,
+        price_int64: int,
+        qty_int: int,
+    ) -> None:
+        """Update portfolio_positions as a derived view (mutable).
+
+        - BUY: increases qty, updates weighted-average cost
+        - SELL: decreases qty, keeps avg cost; if position closed => avg cost reset
+        """
+        if not account_id:
+            # still record fill, but skip position update if account_id unknown
+            return
+        if qty_int <= 0:
+            return
+
+        repo = Repo(s)
+        key = {"account_id": account_id, "symbol": symbol}
+        pos = s.get(models.PortfolioPosition, key)
+        if pos is None:
+            pos = models.PortfolioPosition(
+                account_id=account_id,
+                symbol=symbol,
+                current_qty=0,
+                frozen_qty=0,
+                avg_price_int64=0,
+                updated_at=now_shanghai(),
+            )
+            s.add(pos)
+            s.flush()
+
+        side_u = str(side).upper()
+        cur_qty = int(pos.current_qty)
+        cur_avg = int(pos.avg_price_int64)
+
+        if side_u == "BUY":
+            new_qty = cur_qty + int(qty_int)
+            if new_qty <= 0:
+                pos.current_qty = 0
+                pos.avg_price_int64 = 0
+            else:
+                # weighted average cost (int64)
+                total_cost = cur_avg * cur_qty + int(price_int64) * int(qty_int)
+                pos.current_qty = new_qty
+                pos.avg_price_int64 = int(round(total_cost / new_qty))
+            pos.updated_at = now_shanghai()
+            return
+
+        if side_u == "SELL":
+            new_qty = cur_qty - int(qty_int)
+            if new_qty < 0:
+                repo.system_events.write_event(
+                    event_type="POSITION_NEGATIVE_CLAMP",
+                    correlation_id=None,
+                    severity="WARN",
+                    symbol=symbol,
+                    payload={
+                        "account_id": account_id,
+                        "cur_qty": cur_qty,
+                        "sell_qty": int(qty_int),
+                        "clamped_to": 0,
+                    },
+                )
+                new_qty = 0
+
+            pos.current_qty = int(new_qty)
+            if int(pos.current_qty) == 0:
+                pos.avg_price_int64 = 0
+            pos.updated_at = now_shanghai()
+            return
+
+        # unknown side
+        repo.system_events.write_event(
+            event_type="POSITION_SIDE_UNKNOWN",
+            correlation_id=None,
+            severity="WARN",
+            symbol=symbol,
+            payload={"account_id": account_id, "side": side_u, "qty_int": int(qty_int)},
+        )
 
     def _create_ambiguous_snapshot(
         self,
