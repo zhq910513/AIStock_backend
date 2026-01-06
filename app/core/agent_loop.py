@@ -222,9 +222,18 @@ class AgentLoop:
         params.update(
             {
                 "confidence": float(ro.confidence),
+                # UI-friendly alias (currently: use confidence as next-day limit-up probability proxy)
+                "p_limit_up": float(ro.confidence),
                 "hypothesis": hypothesis,
                 "validation_conclusion": concl,
                 "validation_id": val_id,
+                # UI-friendly explainability buckets
+                "features_snapshot": evidence,
+                "top_features": [
+                    {"k": "momentum_45d", "v": evidence.get("momentum_45d")},
+                    {"k": "vol_20d", "v": evidence.get("vol_20d")},
+                    {"k": "intraday_ret", "v": evidence.get("intraday_ret")},
+                ],
             }
         )
 

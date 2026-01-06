@@ -83,6 +83,65 @@ class SystemStatusRepo:
         st.updated_at = now_shanghai()
 
 
+
+@dataclass
+class ControlsRepo:
+    s: Session
+
+    def get_for_update(self) -> models.RuntimeControls:
+        row = self.s.execute(select(models.RuntimeControls).where(models.RuntimeControls.id == 1)).scalar_one_or_none()
+        if row is None:
+            row = models.RuntimeControls(id=1, updated_at=now_shanghai())
+            self.s.add(row)
+            self.s.flush()
+        return row
+
+    def as_dict(self) -> dict:
+        c = self.get_for_update()
+        return {
+            "auto_trading_enabled": bool(c.auto_trading_enabled),
+            "dry_run": bool(c.dry_run),
+            "only_when_data_ok": bool(c.only_when_data_ok),
+            "max_orders_per_day": int(c.max_orders_per_day),
+            "max_notional_per_order": int(c.max_notional_per_order),
+            "allowed_symbols": list(c.allowed_symbols or []),
+            "blocked_symbols": list(c.blocked_symbols or []),
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+        }
+
+    def patch(self, payload: dict) -> dict:
+        c = self.get_for_update()
+
+        def _to_list(v) -> list[str]:
+            if v is None:
+                return []
+            if isinstance(v, str):
+                # allow comma-separated strings
+                return [x.strip() for x in v.split(",") if x.strip()]
+            if isinstance(v, list):
+                return [str(x).strip() for x in v if str(x).strip()]
+            return []
+
+        if "auto_trading_enabled" in payload:
+            c.auto_trading_enabled = bool(payload["auto_trading_enabled"])
+        if "dry_run" in payload:
+            c.dry_run = bool(payload["dry_run"])
+        if "only_when_data_ok" in payload:
+            c.only_when_data_ok = bool(payload["only_when_data_ok"])
+
+        if "max_orders_per_day" in payload and payload["max_orders_per_day"] is not None:
+            c.max_orders_per_day = int(payload["max_orders_per_day"])
+        if "max_notional_per_order" in payload and payload["max_notional_per_order"] is not None:
+            c.max_notional_per_order = int(payload["max_notional_per_order"])
+
+        if "allowed_symbols" in payload:
+            c.allowed_symbols = _to_list(payload["allowed_symbols"])
+        if "blocked_symbols" in payload:
+            c.blocked_symbols = _to_list(payload["blocked_symbols"])
+
+        c.updated_at = now_shanghai()
+        return self.as_dict()
+
 @dataclass
 class AccountsRepo:
     s: Session
@@ -530,6 +589,11 @@ class Repo:
     @property
     def system_status(self) -> SystemStatusRepo:
         return SystemStatusRepo(self.s)
+
+    @property
+    def controls(self) -> ControlsRepo:
+        return ControlsRepo(self.s)
+
 
     @property
     def accounts(self) -> AccountsRepo:

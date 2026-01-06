@@ -566,6 +566,27 @@ class SystemStatus(Base):
     __table_args__ = (CheckConstraint("id = 1", name="ck_system_status_singleton"),)
 
 
+
+class RuntimeControls(Base):
+    __tablename__ = "runtime_controls"
+    id = Column(Integer, primary_key=True, default=1)
+
+    # Writable runtime toggles (UI)
+    auto_trading_enabled = Column(Boolean, nullable=False, default=False)
+    dry_run = Column(Boolean, nullable=False, default=True)
+    only_when_data_ok = Column(Boolean, nullable=False, default=True)
+
+    max_orders_per_day = Column(Integer, nullable=False, default=10)
+    max_notional_per_order = Column(BigInteger, nullable=False, default=0)
+
+    allowed_symbols = Column(JSONB, nullable=False, default=list)
+    blocked_symbols = Column(JSONB, nullable=False, default=list)
+
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (CheckConstraint("id = 1", name="ck_runtime_controls_singleton"),)
+
+
 class SystemEvent(Base):
     __tablename__ = "system_events"
 

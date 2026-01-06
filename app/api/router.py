@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -7,12 +9,33 @@ from sqlalchemy.orm import Session
 from app.database.engine import SessionLocal
 from app.database.repo import Repo
 from app.database import models
-from app.utils.time import now_shanghai_str
+from app.utils.time import now_shanghai_str, now_shanghai, to_shanghai, trading_day_str
 from app.utils.crypto import sha256_hex
 from app.config import settings
 
 
 router = APIRouter()
+
+
+def _parse_ui_day(day: str | None) -> tuple[str | None, datetime | None, datetime | None]:
+    """Accepts YYYY-MM-DD or YYYYMMDD. Returns (trading_day_YYYYMMDD, start_dt, end_dt) in Asia/Shanghai."""
+    if not day:
+        return None, None, None
+    d = day.strip()
+    if not d:
+        return None, None, None
+    if len(d) == 8 and d.isdigit():
+        td = d
+        dt = datetime.strptime(td, "%Y%m%d")
+    else:
+        # allow YYYY-MM-DD
+        dt = datetime.strptime(d, "%Y-%m-%d")
+        td = dt.strftime("%Y%m%d")
+    start = to_shanghai(dt).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    return td, start, end
+
+
 
 
 @router.get("/health")
@@ -71,13 +94,13 @@ def run_self_check() -> dict:
 
 
 @router.get("/decisions")
-def list_decisions(limit: int = 50) -> list[dict]:
+def list_decisions(limit: int = 50, day: str | None = None) -> list[dict]:
+    td, start, end = _parse_ui_day(day)
     with SessionLocal() as s:
-        rows = (
-            s.execute(select(models.DecisionBundle).order_by(models.DecisionBundle.created_at.desc()).limit(limit))
-            .scalars()
-            .all()
-        )
+        q = select(models.DecisionBundle).order_by(models.DecisionBundle.created_at.desc())
+        if start and end:
+            q = q.where(models.DecisionBundle.created_at >= start, models.DecisionBundle.created_at < end)
+        rows = s.execute(q.limit(limit)).scalars().all()
         return [
             {
                 "decision_id": r.decision_id,
@@ -87,11 +110,13 @@ def list_decisions(limit: int = 50) -> list[dict]:
                 "decision": r.decision,
                 "confidence": float((r.params or {}).get("confidence", 0.0)) if isinstance(r.params, dict) else None,
                 "reason_code": r.reason_code,
-                "created_at": r.created_at.isoformat(),
+                "params": r.params,
                 "request_ids": r.request_ids,
-                "feature_hash": r.feature_hash,
                 "model_hash": r.model_hash,
+                "feature_hash": r.feature_hash,
+                "guard_status": r.guard_status,
                 "data_quality": r.data_quality,
+                "created_at": r.created_at.isoformat(),
             }
             for r in rows
         ]
@@ -145,6 +170,114 @@ def get_data_response(response_id: str) -> dict:
             "received_at": r.received_at.isoformat(),
             "raw": r.raw,
         }
+
+
+
+@router.get("/ui/signal_inputs")
+def ui_signal_inputs(day: str) -> list[dict]:
+    """List yesterday signal inputs (signals) with next-day limit-up probability proxy."""
+    td, start, end = _parse_ui_day(day)
+    if not td:
+        raise HTTPException(status_code=400, detail="day is required (YYYY-MM-DD or YYYYMMDD)")
+
+    with SessionLocal() as s:
+        # Signals for the given trading day (intent pool)
+        sigs = (
+            s.execute(
+                select(models.Signal)
+                .where(models.Signal.trading_day == td)
+                .order_by(models.Signal.confidence.desc())
+            )
+            .scalars()
+            .all()
+        )
+
+        symbols = [x.symbol for x in sigs]
+        latest_dec_by_sym: dict[str, models.DecisionBundle] = {}
+        if symbols and start and end:
+            decs = (
+                s.execute(
+                    select(models.DecisionBundle)
+                    .where(models.DecisionBundle.created_at >= start, models.DecisionBundle.created_at < end)
+                    .where(models.DecisionBundle.symbol.in_(symbols))
+                    .order_by(models.DecisionBundle.created_at.desc())
+                )
+                .scalars()
+                .all()
+            )
+            for drow in decs:
+                if drow.symbol not in latest_dec_by_sym:
+                    latest_dec_by_sym[drow.symbol] = drow
+
+        target_day = (datetime.strptime(td, "%Y%m%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        trading_day_fmt = datetime.strptime(td, "%Y%m%d").strftime("%Y-%m-%d")
+
+        out: list[dict] = []
+        for i, r in enumerate(sigs, start=1):
+            dec = latest_dec_by_sym.get(r.symbol)
+            params = dec.params if (dec and isinstance(dec.params, dict)) else {}
+            out.append(
+                {
+                    "id": r.cid,
+                    "trading_day": trading_day_fmt,
+                    "target_day": target_day,
+                    "symbol": r.symbol,
+                    "strategy_id": r.strategy_id,
+                    "input_ts": r.signal_ts.isoformat(),
+                    # Proxy: p_limit_up currently equals model confidence (0..1)
+                    "p_limit_up": float(r.confidence),
+                    "rank": i,
+                    "reason_code": (dec.reason_code if dec else ""),
+                    "top_features": params.get("top_features"),
+                    "features_snapshot": params.get("features_snapshot") or params.get("evidence") or params,
+                }
+            )
+        return out
+
+
+@router.get("/ui/controls")
+def ui_controls() -> dict:
+    with SessionLocal() as s:
+        repo = Repo(s)
+        st = repo.system_status.get_for_update()
+        c = repo.controls.get_for_update()
+
+        self_check_valid_until = None
+        if st.last_self_check_time:
+            self_check_valid_until = (st.last_self_check_time + timedelta(seconds=int(settings.SELF_CHECK_MAX_AGE_SEC))).isoformat()
+
+        # best-effort: "data_degraded" not fully modeled yet (defaults to False)
+        resp = {
+            # writable
+            "auto_trading_enabled": bool(c.auto_trading_enabled),
+            "dry_run": bool(c.dry_run),
+            "only_when_data_ok": bool(c.only_when_data_ok),
+            "max_orders_per_day": int(c.max_orders_per_day),
+            "max_notional_per_order": int(c.max_notional_per_order),
+            "allowed_symbols": list(c.allowed_symbols or []),
+            "blocked_symbols": list(c.blocked_symbols or []),
+
+            # readonly status / governance
+            "panic_halt": bool(st.panic_halt),
+            "guard_level": int(st.guard_level),
+            "veto": bool(st.veto),
+            "veto_code": st.veto_code,
+            "data_degraded": False,
+            "self_check_valid_until": self_check_valid_until,
+            "ths_mode": settings.THS_MODE,
+            "time": now_shanghai_str(),
+        }
+        s.commit()
+        return resp
+
+
+@router.patch("/ui/controls")
+def ui_controls_patch(payload: dict) -> dict:
+    with SessionLocal() as s:
+        repo = Repo(s)
+        updated = repo.controls.patch(payload or {})
+        s.commit()
+        return updated
 
 
 @router.get("/accounts")

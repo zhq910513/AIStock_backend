@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -19,7 +19,7 @@ from app.core.exit_monitor import ExitMonitor
 from app.database.engine import SessionLocal
 from app.database.repo import Repo
 from app.database import models
-from app.utils.time import now_shanghai, trading_day_str, fmt_ts_millis
+from app.utils.time import now_shanghai, trading_day_str, fmt_ts_millis, to_shanghai
 from app.utils.ids import make_cid
 from app.utils.crypto import sha256_hex
 from app.utils.p2 import P2Quantile
@@ -64,6 +64,44 @@ class Orchestrator:
 
         age = (now_shanghai() - st.last_self_check_time).total_seconds()
         return age <= float(settings.SELF_CHECK_MAX_AGE_SEC)
+
+
+    def _execution_controls_ok(self, repo: Repo, symbol: str, account_id: str | None, data_status: str) -> tuple[bool, str]:
+        """Runtime controls gate. Returns (ok, reason)."""
+        c = repo.controls.get_for_update()
+
+        if not bool(c.auto_trading_enabled):
+            return False, "auto_trading_disabled"
+
+        # symbol allow/deny lists
+        blocked = set((c.blocked_symbols or []))
+        if symbol in blocked:
+            return False, "symbol_blocked"
+
+        allowed = list(c.allowed_symbols or [])
+        if allowed and symbol not in set(allowed):
+            return False, "symbol_not_in_allowlist"
+
+        # data quality gate
+        if bool(c.only_when_data_ok) and (data_status or "") not in {"VALID", "OK"}:
+            return False, "data_not_ok"
+
+        # daily order limit (best-effort)
+        try:
+            now_dt = now_shanghai()
+            start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            end = start + timedelta(days=1)
+            q = select(func.count(models.Order.cid)).where(models.Order.account_id == (account_id or settings.DEFAULT_ACCOUNT_ID))
+            q = q.where(models.Order.created_at >= start, models.Order.created_at < end)
+            cnt = int(repo.s.execute(q).scalar_one() or 0)
+            if cnt >= int(c.max_orders_per_day):
+                return False, "max_orders_per_day_reached"
+        except Exception:
+            # do not hard-fail on counting
+            pass
+
+        return True, "ok"
+
 
     async def _tick(self) -> None:
         tick_now = now_shanghai()
@@ -200,54 +238,51 @@ class Orchestrator:
                     )
 
                 if agent_dec.decision in {"BUY", "SELL"}:
-                    if not self._trade_gate_ok(repo):
-                        repo.system_events.write_event(
-                            event_type="TRADE_GATE_BLOCKED",
-                            correlation_id=corr,
-                            severity="WARN",
-                            symbol=sym,
-                            payload={"reason": "guard_or_self_check"},
-                        )
-                        continue
-
+                    # Always record model intent as a Signal (even if execution is blocked)
                     signal_dt = now_shanghai()
                     td = trading_day_str(signal_dt)
-                    signal_ts_millis = fmt_ts_millis(signal_dt)
-
                     nonce = repo.nonce.next_nonce(sym, "PRIMARY", account_id=account_id)
                     cid = make_cid(
                         trading_day=td,
                         symbol=sym,
                         strategy_id="PRIMARY",
-                        signal_ts_millis=signal_ts_millis,
+                        signal_ts=signal_dt,
                         nonce=nonce,
                         side=agent_dec.decision,
                         intended_qty_or_notional=100,
-                        account_id=account_id,
                     )
-
-                    s.add(
-                        models.Signal(
-                            cid=cid,
-                            account_id=account_id,
-                            trading_day=td,
-                            symbol=sym,
-                            strategy_id="PRIMARY",
-                            signal_ts=signal_dt,
-                            nonce=nonce,
-                            side=agent_dec.decision,
-                            intended_qty_or_notional=100,
-                            confidence=agent_dec.confidence,
-                            rule_set_version_hash=settings.RULESET_VERSION_HASH,
-                            strategy_contract_hash=settings.STRATEGY_CONTRACT_HASH,
-                            model_snapshot_uuid=settings.MODEL_SNAPSHOT_UUID,
-                            cost_model_version=settings.COST_MODEL_VERSION,
-                            feature_extractor_version=settings.FEATURE_EXTRACTOR_VERSION,
-                            lineage_ref=raw_row.payload_sha256,
-                            created_at=now_shanghai(),
+                    existing_signal = s.get(models.Signal, cid)
+                    if existing_signal is None:
+                        s.add(
+                            models.Signal(
+                                cid=cid,
+                                account_id=account_id,
+                                trading_day=td,
+                                symbol=sym,
+                                strategy_id="PRIMARY",
+                                signal_ts=signal_dt,
+                                nonce=nonce,
+                                side=agent_dec.decision,
+                                intended_qty_or_notional=100,
+                                confidence=agent_dec.confidence,
+                                rule_set_version_hash=settings.RULESET_VERSION_HASH,
+                                strategy_contract_hash=settings.STRATEGY_CONTRACT_HASH,
+                                model_snapshot_uuid=settings.MODEL_SNAPSHOT_UUID,
+                                cost_model_version=settings.COST_MODEL_VERSION,
+                                feature_extractor_version=settings.FEATURE_EXTRACTOR_VERSION,
+                                lineage_ref=raw_row.payload_sha256,
+                                created_at=now_shanghai(),
+                            )
                         )
+                
+                    # bind decision->cid (best-effort) even if we don't execute an order
+                    s.execute(
+                        models.DecisionBundle.__table__.update()
+                        .where(models.DecisionBundle.decision_id == decision_id)
+                        .values(cid=cid)
                     )
-
+                
+                    # Guard first (risk veto)
                     gr = self.guard.evaluate(s, sym, agent_dec.decision, intended_qty=100, account_id=account_id)
                     if gr.veto:
                         repo.system_events.write_event(
@@ -258,7 +293,30 @@ class Orchestrator:
                             payload={"guard_level": gr.guard_level, "veto_code": gr.veto_code, "account_id": account_id},
                         )
                         continue
-
+                
+                    # Governance gate (PANIC/VETO + SELF_CHECK)
+                    if not self._trade_gate_ok(repo):
+                        repo.system_events.write_event(
+                            event_type="TRADE_GATE_BLOCKED",
+                            correlation_id=corr,
+                            severity="WARN",
+                            symbol=sym,
+                            payload={"reason": "guard_or_self_check"},
+                        )
+                        continue
+                
+                    # Runtime execution controls (AUTO_TRADING, DRY_RUN, limits, allow/deny lists)
+                    ctrl_ok, ctrl_reason = self._execution_controls_ok(repo, sym, account_id=account_id, data_status=raw_row.data_status)
+                    if not ctrl_ok:
+                        repo.system_events.write_event(
+                            event_type="EXECUTION_BLOCKED",
+                            correlation_id=cid,
+                            severity="INFO",
+                            symbol=sym,
+                            payload={"reason": ctrl_reason, "account_id": account_id},
+                        )
+                        continue
+                
                     self.order_manager.create_order(
                         s=s,
                         cid=cid,
@@ -270,14 +328,19 @@ class Orchestrator:
                         qty=100,
                         strategy_contract_hash=settings.STRATEGY_CONTRACT_HASH,
                     )
-                    self.order_manager.submit(s, cid)
+                
+                    # DRY_RUN means we create orders but do not submit to the outbox/broker
+                    if not repo.controls.get_for_update().dry_run:
+                        self.order_manager.submit(s, cid)
+                    else:
+                        repo.system_events.write_event(
+                            event_type="DRY_RUN_ORDER_CREATED",
+                            correlation_id=cid,
+                            severity="INFO",
+                            symbol=sym,
+                            payload={"note": "order created but not submitted (dry_run=true)", "account_id": account_id},
+                        )
 
-                    # bind decision->cid (best-effort)
-                    s.execute(
-                        models.DecisionBundle.__table__.update()
-                        .where(models.DecisionBundle.decision_id == decision_id)
-                        .values(cid=cid)
-                    )
 
             s.commit()
 

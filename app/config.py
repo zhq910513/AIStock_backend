@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import field_validator
 
 
 class Settings(BaseSettings):
@@ -31,10 +32,22 @@ class Settings(BaseSettings):
     ORCH_LOOP_INTERVAL_MS: int = 750
     SCHED_DRIFT_THRESHOLD_MS: int = 250  # drift event threshold
 
-    # --- Data providers ---
+    # --- THS adapter (market events source) ---
+    # MOCK / IFIND_HTTP
+    THS_MODE: str = "MOCK"
+
+    # --- Data providers (agent loop evidence collection) ---
     DATA_PROVIDER: str = "IFIND_HTTP"  # MOCK / IFIND_HTTP
+
+    # --- iFinD QuantAPI (HTTP) ---
     IFIND_HTTP_BASE_URL: str = "https://quantapi.51ifind.com"
-    IFIND_HTTP_TOKEN: str = ""  # access_token
+    # Short-lived token (expires ~7 days). Prefer using refresh token.
+    IFIND_HTTP_TOKEN: str = ""
+    # Long-lived refresh token (aligned with account expiry). Used to obtain/refresh access_token.
+    IFIND_HTTP_REFRESH_TOKEN: str = ""
+    # If we don't know the token expiry precisely, we can still proactively refresh on a cadence.
+    IFIND_HTTP_TOKEN_MAX_AGE_SEC: int = 6 * 24 * 3600  # 6 days (safety buffer vs 7 days)
+    IFIND_HTTP_TOKEN_EARLY_REFRESH_SEC: int = 15 * 60  # refresh early when nearing max-age
 
     # --- Multi-account (execution plane) ---
     DEFAULT_ACCOUNT_ID: str = "ACC_PRIMARY"
@@ -56,6 +69,22 @@ class Settings(BaseSettings):
 
     # --- API schema versioning ---
     API_SCHEMA_VERSION: str = "1"
+
+    @field_validator("IFIND_HTTP_BASE_URL", mode="before")
+    @classmethod
+    def _coerce_base_url(cls, v: object) -> str:
+        # Important: env can override defaults with an empty string; treat it as "unset".
+        if v is None:
+            return "https://quantapi.51ifind.com"
+        s = str(v).strip()
+        return s or "https://quantapi.51ifind.com"
+
+    @field_validator("IFIND_HTTP_TOKEN", "IFIND_HTTP_REFRESH_TOKEN", mode="before")
+    @classmethod
+    def _coerce_token(cls, v: object) -> str:
+        if v is None:
+            return ""
+        return str(v).strip()
 
 
 settings = Settings()
