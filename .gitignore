@@ -12,8 +12,6 @@ venv/
 ENV/
 
 # Build artifacts
-build/
-dist/
 *.egg-info/
 
 # Test / tooling
