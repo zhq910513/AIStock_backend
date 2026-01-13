@@ -3,3 +3,5 @@ git pull
 
 cd /data/compose/aistock
 docker compose up -d --build
+
+

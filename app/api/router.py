@@ -4,12 +4,11 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Body
 from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 from app.database.engine import SessionLocal
 from app.database.repo import Repo
 from app.database import models
-from app.utils.time import now_shanghai_str, now_shanghai, to_shanghai, trading_day_str
+from app.utils.time import now_shanghai_str, now_shanghai, to_shanghai
 from app.utils.crypto import sha256_hex
 from app.config import settings
 from app.core.labeling_planner import build_plan
@@ -29,14 +28,11 @@ def _parse_ui_day(day: str | None) -> tuple[str | None, datetime | None, datetim
         td = d
         dt = datetime.strptime(td, "%Y%m%d")
     else:
-        # allow YYYY-MM-DD
         dt = datetime.strptime(d, "%Y-%m-%d")
         td = dt.strftime("%Y%m%d")
     start = to_shanghai(dt).replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
     return td, start, end
-
-
 
 
 @router.get("/health")
@@ -68,7 +64,7 @@ def run_self_check() -> dict:
     """
     with SessionLocal() as s:
         repo = Repo(s)
-        st = repo.system_status.get_for_update()
+        _st = repo.system_status.get_for_update()
 
         report = {
             "time": now_shanghai_str(),
@@ -96,7 +92,7 @@ def run_self_check() -> dict:
 
 @router.get("/decisions")
 def list_decisions(limit: int = 50, day: str | None = None) -> list[dict]:
-    td, start, end = _parse_ui_day(day)
+    _td, start, end = _parse_ui_day(day)
     with SessionLocal() as s:
         q = select(models.DecisionBundle).order_by(models.DecisionBundle.created_at.desc())
         if start and end:
@@ -171,7 +167,6 @@ def get_data_response(response_id: str) -> dict:
             "received_at": r.received_at.isoformat(),
             "raw": r.raw,
         }
-
 
 
 @router.get("/ui/signal_inputs")
@@ -289,43 +284,65 @@ def upsert_ui_signal_inputs(payload: dict = Body(...)) -> dict:
 
     with SessionLocal() as s:
         repo = Repo(s)
+
+        # 1) Always upsert candidates first (UI write path must not be blocked by planner/provider issues)
         res = repo.labeling_candidates.upsert_batch(trading_day=td, target_day=target_td, items=items, source="UI")
 
-        # Update watchlist (symbols may appear repeatedly across days).
-        # When LABELING_AUTO_FETCH_ENABLED is on, enqueue a model-driven (planner) data fetch plan.
-        planned = 0
+        # 2) Update watchlist and optionally enqueue planned data fetches
+        planned_created = 0
+        planned_total = 0
+        planner_errors: list[dict] = []
+
         for it in items:
             symbol = str((it or {}).get("symbol") or "").strip()
             if not symbol:
                 continue
+
             wl = repo.watchlist.upsert_hit(symbol=symbol, trading_day=td)
-            if settings.LABELING_AUTO_FETCH_ENABLED and wl.active:
-                plan = build_plan(symbol=symbol, hit_count=int(wl.hit_count), planner_state=dict(wl.planner_state or {}))
+
+            if not bool(settings.LABELING_AUTO_FETCH_ENABLED) or not bool(wl.active):
+                continue
+
+            try:
+                plan = build_plan(
+                    symbol=symbol,
+                    trading_day=td,
+                    hit_count=int(wl.hit_count or 0),
+                    planner_state=dict(wl.planner_state or {}),
+                )
                 # Persist planner state back
                 wl.planner_state = plan.planner_state
+
                 for pr in plan.requests:
-                    repo.data_requests.enqueue(
-                        dedupe_key=pr.dedupe_key,
-                        correlation_id=pr.correlation_id,
-                        account_id=None,
-                        symbol=symbol,
-                        purpose=pr.purpose,
-                        provider=settings.DATA_PROVIDER,
-                        endpoint=pr.endpoint,
-                        params_canonical=pr.params_canonical,
-                        request_payload=pr.payload,
-                        deadline_sec=pr.deadline_sec,
-                    )
-                    planned += 1
+                    planned_total += 1
+                    _rid, created = repo.data_requests.enqueue_planned(pr, provider=settings.DATA_PROVIDER)
+                    if created:
+                        planned_created += 1
+            except Exception as e:
+                # Never let planner issues make UI 500; record as system event for debugging.
+                err = {"symbol": symbol, "error": f"{type(e).__name__}: {e}"}
+                planner_errors.append(err)
+                repo.system_events.write_event(
+                    event_type="LABELING_PLANNER_ERROR",
+                    correlation_id=None,
+                    severity="WARN",
+                    payload=err,
+                    symbol=symbol,
+                )
 
         s.commit()
-        res["planned_requests"] = planned
 
-    return {
+    out = {
         "trading_day": datetime.strptime(td, "%Y%m%d").strftime("%Y-%m-%d"),
         "target_day": datetime.strptime(target_td, "%Y%m%d").strftime("%Y-%m-%d"),
         **res,
+        "planned_requests_total": planned_total,
+        "planned_requests_created": planned_created,
     }
+    if planner_errors:
+        out["planner_errors"] = planner_errors
+    return out
+
 
 @router.get("/ui/controls")
 def ui_controls() -> dict:
@@ -336,9 +353,10 @@ def ui_controls() -> dict:
 
         self_check_valid_until = None
         if st.last_self_check_time:
-            self_check_valid_until = (st.last_self_check_time + timedelta(seconds=int(settings.SELF_CHECK_MAX_AGE_SEC))).isoformat()
+            self_check_valid_until = (
+                st.last_self_check_time + timedelta(seconds=int(settings.SELF_CHECK_MAX_AGE_SEC))
+            ).isoformat()
 
-        # best-effort: "data_degraded" not fully modeled yet (defaults to False)
         resp = {
             # writable
             "auto_trading_enabled": bool(c.auto_trading_enabled),
@@ -348,7 +366,6 @@ def ui_controls() -> dict:
             "max_notional_per_order": int(c.max_notional_per_order),
             "allowed_symbols": list(c.allowed_symbols or []),
             "blocked_symbols": list(c.blocked_symbols or []),
-
             # readonly status / governance
             "panic_halt": bool(st.panic_halt),
             "guard_level": int(st.guard_level),
@@ -370,7 +387,6 @@ def ui_controls_patch(payload: dict) -> dict:
         updated = repo.controls.patch(payload or {})
         s.commit()
         return updated
-
 
 
 @router.get("/ui/watchlist")
@@ -439,7 +455,6 @@ def ui_symbol_snapshots(symbol: str, limit: int = 50) -> list[dict]:
 
 @router.get("/ui/labeling_settings")
 def ui_labeling_settings() -> dict:
-    # read-only view of pipeline knobs (controlled via env)
     return {
         "auto_fetch_enabled": bool(settings.LABELING_AUTO_FETCH_ENABLED),
         "poll_ms": int(settings.LABELING_PIPELINE_POLL_MS),

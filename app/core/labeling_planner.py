@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 import hashlib
+import json
+from urllib.parse import quote_plus
 
 from app.config import settings
 from app.utils.time import now_shanghai
@@ -13,11 +15,20 @@ from app.utils.time import now_shanghai
 class PlannedRequest:
     symbol: str
     endpoint: str
-    params: dict
+    # Payload to provider (iFinD QuantAPI).
+    payload: dict
+    # Stable canonical string for dedupe & tracing (stored in DB, max 2048 chars).
+    params_canonical: str
     purpose: str
     priority: int
     dedupe_key: str
     correlation_id: str
+    deadline_sec: int | None = None
+
+    # Backward-compat alias (some older code used `params`).
+    @property
+    def params(self) -> dict:
+        return self.payload
 
 
 @dataclass
@@ -38,10 +49,31 @@ def _stage_from_hits(hit_count: int) -> int:
     return 0
 
 
-def _dedupe_key(symbol: str, endpoint: str, params: dict) -> str:
-    items = sorted((k, str(v)) for k, v in (params or {}).items())
-    joined = "&".join([f"{k}={v}" for k, v in items])
-    return f"{symbol}|{endpoint}|{joined}"
+def _params_canonical(payload: dict) -> str:
+    """Make a stable, compact string for request parameters.
+
+    - Sort keys
+    - JSON-dump nested dict/list values with sort_keys
+    - URL-escape values so '&' and '=' don't break the format
+    """
+    items: list[tuple[str, str]] = []
+    for k in sorted((payload or {}).keys()):
+        v = (payload or {}).get(k)
+        if isinstance(v, (dict, list)):
+            vs = json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        else:
+            vs = "" if v is None else str(v)
+        items.append((str(k), quote_plus(vs)))
+    s = "&".join([f"{k}={v}" for k, v in items])
+    # DB column is 2048; keep a safe buffer.
+    return s[:2000]
+
+
+def _mk_dedupe_key(trading_day: str, endpoint: str, params_canonical: str) -> str:
+    """DataRequest.dedupe_key max len is 128; use a short hash."""
+    h = hashlib.sha256(f"{endpoint}|{params_canonical}".encode("utf-8")).hexdigest()[:16]
+    ep = (endpoint or "").replace("/", "_")[:32]
+    return f"LP:{trading_day}:{ep}:{h}"[:128]
 
 
 def _mk_correlation_id(trading_day: str, stage: int, dedupe_key: str) -> str:
@@ -85,68 +117,88 @@ def build_plan(
     hf_limit = int(getattr(settings, "LABELING_HF_LIMIT_BASE", 240))
     hf_limit = max(60, min(2000, hf_limit + stage * 120))
 
-    # iFinD HTTP: params里既放 ths_code，也放 symbol
-    rt_payload = {"symbol": symbol, "ths_code": symbol}
+    # iFinD QuantAPI commonly uses `codes=...`; keep both to be robust.
+    rt_payload = {
+        "codes": symbol,
+        "indicators": "open,high,low,latest,close,volume,amount",
+        "symbol": symbol,
+        "ths_code": symbol,
+    }
 
     end_dt = now
     start_dt = now - timedelta(days=history_days)
 
     hist_payload = {
+        "codes": symbol,
+        "indicators": "open,high,low,close,volume,amount",
+        "startdate": start_dt.strftime("%Y-%m-%d"),
+        "enddate": end_dt.strftime("%Y-%m-%d"),
+        "functionpara": {"Fill": "Blank"},
         "symbol": symbol,
         "ths_code": symbol,
-        "start": start_dt.strftime("%Y-%m-%d"),
-        "end": end_dt.strftime("%Y-%m-%d"),
-        "period": "D",
     }
 
     hf_payload = {
-        "symbol": symbol,
-        "ths_code": symbol,
+        "codes": symbol,
         "day": td,
         "limit": hf_limit,
+        "symbol": symbol,
+        "ths_code": symbol,
     }
 
     reqs: list[PlannedRequest] = []
 
     # 1) real-time quote
-    dk1 = _dedupe_key(symbol, "IFIND_HTTP.real_time_quotation", rt_payload)
+    ep1 = "real_time_quotation"
+    pc1 = _params_canonical(rt_payload)
+    dk1 = _mk_dedupe_key(td, ep1, pc1)
     reqs.append(
         PlannedRequest(
             symbol=symbol,
-            endpoint="IFIND_HTTP.real_time_quotation",
-            params=rt_payload,
+            endpoint=ep1,
+            payload=rt_payload,
+            params_canonical=pc1,
             purpose="LABELING_BASE",
             priority=100,
             dedupe_key=dk1,
             correlation_id=_mk_correlation_id(td, stage, dk1),
+            deadline_sec=5,
         )
     )
 
     # 2) daily history
-    dk2 = _dedupe_key(symbol, "IFIND_HTTP.cmd_history_quotation", hist_payload)
+    ep2 = "cmd_history_quotation"
+    pc2 = _params_canonical(hist_payload)
+    dk2 = _mk_dedupe_key(td, ep2, pc2)
     reqs.append(
         PlannedRequest(
             symbol=symbol,
-            endpoint="IFIND_HTTP.cmd_history_quotation",
-            params=hist_payload,
+            endpoint=ep2,
+            payload=hist_payload,
+            params_canonical=pc2,
             purpose="LABELING_BASE" if stage == 0 else "LABELING_EXPAND",
             priority=80,
             dedupe_key=dk2,
             correlation_id=_mk_correlation_id(td, stage, dk2),
+            deadline_sec=8,
         )
     )
 
     # 3) high frequency
-    dk3 = _dedupe_key(symbol, "IFIND_HTTP.high_frequency", hf_payload)
+    ep3 = "high_frequency"
+    pc3 = _params_canonical(hf_payload)
+    dk3 = _mk_dedupe_key(td, ep3, pc3)
     reqs.append(
         PlannedRequest(
             symbol=symbol,
-            endpoint="IFIND_HTTP.high_frequency",
-            params=hf_payload,
+            endpoint=ep3,
+            payload=hf_payload,
+            params_canonical=pc3,
             purpose="LABELING_BASE" if stage == 0 else "LABELING_REFRESH",
             priority=60,
             dedupe_key=dk3,
             correlation_id=_mk_correlation_id(td, stage, dk3),
+            deadline_sec=10,
         )
     )
 

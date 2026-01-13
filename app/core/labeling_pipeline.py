@@ -91,7 +91,8 @@ class LabelingPipeline:
 
                 # enqueue data requests (dedupe inside repo)
                 for req in plan.requests:
-                    if repo.data_requests.enqueue(req):
+                    _rid, created = repo.data_requests.enqueue_planned(req, provider=settings.DATA_PROVIDER)
+                    if created:
                         count += 1
 
                 # schedule next refresh
@@ -158,7 +159,8 @@ class LabelingPipeline:
 
                 plan = build_plan(symbol=symbol, trading_day=td, hit_count=int(row.hit_count or 0))
                 for req in plan.requests:
-                    if repo.data_requests.enqueue(req):
+                    _rid, created = repo.data_requests.enqueue_planned(req, provider=settings.DATA_PROVIDER)
+                    if created:
                         enq += 1
 
                 repo.watchlist.set_next_refresh_in(symbol, calc_refresh_seconds(int(row.hit_count or 0)))
