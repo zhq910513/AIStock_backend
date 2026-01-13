@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from app.config import settings
 from app.core.data_dispatcher import DataRequestDispatcher
-from app.core.labeling_planner import build_plan, calc_refresh_sec
+from app.core.labeling_planner import build_plan, calc_refresh_seconds
 from app.database.engine import SessionLocal
 from app.database.repo import Repo
 from app.database import models
@@ -207,7 +207,7 @@ class LabelingPipeline:
                     )
 
                 # schedule next refresh
-                repo.watchlist.set_next_refresh_in(symbol, calc_refresh_sec(int(row.hit_count or 0)))
+                repo.watchlist.set_next_refresh_in(symbol, calc_refresh_seconds(int(row.hit_count or 0)))
 
                 # persist planner state marker
                 st = dict(row.planner_state or {})
