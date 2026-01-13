@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 from app.config import settings
@@ -24,6 +24,7 @@ class Plan:
     trading_day: str
     stage: int
     requests: list[PlannedRequest]
+    planner_state: dict[str, Any]
 
 
 def _stage_from_hits(hit_count: int) -> int:
@@ -49,12 +50,12 @@ def build_plan(
     **_: Any,
 ) -> Plan:
     """
-    Rule-based planner (v1),兼容两种调用方式：
-      - API router: build_plan(symbol=..., hit_count=..., planner_state={...})
-      - Pipeline:   build_plan(symbol=..., trading_day=..., hit_count=...)
+    Rule-based planner (v1),兼容 router/pipeline 两种调用方式：
+      - router:   build_plan(symbol=..., hit_count=..., planner_state={...})
+      - pipeline: build_plan(symbol=..., trading_day=..., hit_count=...)
 
-    planner_state 当前版本先作为“未来扩维/去重/阶段记忆”的输入保留，
-    v1 里不强依赖它（避免因为 state 格式变化导致启动/接口崩溃）。
+    返回 Plan 时一定带 planner_state，用于 watchlist 持久化，避免 500。
+    v1 里先写入一些基础元信息，为后续“持续扩维/持续更新/基因画像”做铺垫。
     """
     symbol = (symbol or "").strip()
     now = now_shanghai()
@@ -77,7 +78,7 @@ def build_plan(
     hf_limit = int(getattr(settings, "LABELING_HF_LIMIT_BASE", 240))
     hf_limit = max(60, min(2000, hf_limit + stage * 120))
 
-    # iFinD HTTP: params里既放 ths_code，也放 symbol，便于你们后端做 adapter/兼容 mock
+    # iFinD HTTP: params里既放 ths_code，也放 symbol，便于你们 adapter / mock
     rt_payload = {"symbol": symbol, "ths_code": symbol}
 
     end_dt = now
@@ -136,10 +137,15 @@ def build_plan(
         )
     )
 
-    # planner_state 预留：未来你要“同一股票持续扩维/持续更新”时会在这里用到
-    _ = planner_state  # noqa: F841
+    # ---- planner_state：持久化到 watchlist，用于后续持续扩维/持续更新 ----
+    st: dict[str, Any] = dict(planner_state or {})
+    # 记录本次规划元信息（后续你要做“涨停基因画像”时很有用）
+    st["stage"] = stage
+    st["last_planned_day"] = td
+    st["history_days"] = history_days
+    st["hf_limit"] = hf_limit
 
-    return Plan(symbol=symbol, trading_day=td, stage=stage, requests=reqs)
+    return Plan(symbol=symbol, trading_day=td, stage=stage, requests=reqs, planner_state=st)
 
 
 def calc_refresh_seconds(hit_count: int) -> int:

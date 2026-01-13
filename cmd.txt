@@ -1,0 +1,5 @@
+cd /data/backend/aistock_backend/
+git pull
+
+cd /data/compose/aistock
+docker compose up -d --build
