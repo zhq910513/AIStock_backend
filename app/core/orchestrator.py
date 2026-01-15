@@ -10,7 +10,7 @@ from app.adapters.pool_fetcher import fetch_limitup_pool
 from app.config import settings
 from app.database.engine import SessionLocal
 from app.database import models
-from app.core.recommender_v1 import generate_for_batch, persist_decisions
+from app.core.recommender_v2 import generate_for_batch_v2, persist_decisions_v2
 from app.core.collector_pipeline import run_collectors_for_committed_batch
 from app.utils.crypto import sha256_hex
 from app.utils.symbols import normalize_symbol
@@ -275,8 +275,8 @@ class Orchestrator:
                 # Offline collectors (history/theme) - can run any day.
                 # Idempotent per (batch_id, step_name).
                 run_collectors_for_committed_batch(s, b)
-                items = generate_for_batch(s, b)
-                persist_decisions(s, b, items)
+                items = generate_for_batch_v2(s, b)
+                persist_decisions_v2(s, b, items)
                 # idempotent: once decisions persisted, keep batch in COMMITTED
 
             s.commit()

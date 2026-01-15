@@ -14,8 +14,9 @@ from app.utils.symbols import normalize_symbol
 from app.config import settings
 from app.core.labeling_planner import build_plan
 from app.adapters.pool_fetcher import fetch_limitup_pool
-from app.core.recommender_v1 import generate_for_batch, persist_decisions
+from app.core.recommender_v2 import generate_for_batch_v2, persist_decisions_v2
 from app.core.collector_pipeline import run_collectors_for_committed_batch
+from app.core.cutoff_tasks import run_eod_cutoff_1530
 
 
 router = APIRouter()
@@ -444,8 +445,8 @@ def commit_pool_batch(batch_id: str) -> dict:
         run_collectors_for_committed_batch(s, b)
 
         # generate recommendations now
-        items = generate_for_batch(s, b)
-        persist_decisions(s, b, items)
+        items = generate_for_batch_v2(s, b)
+        persist_decisions_v2(s, b, items)
         s.commit()
 
         return {
@@ -880,3 +881,126 @@ def list_accounts() -> list[dict]:
         rows = repo.accounts.list_accounts()
         s.commit()
         return [{"account_id": r.account_id, "broker_type": r.broker_type, "created_at": r.created_at.isoformat()} for r in rows]
+
+@router.get("/recommendations/trace")
+def get_recommendation_trace(symbol: str, limit_days: int = 10) -> dict:
+    """Trace a symbol's recommendation changes over recent trading days.
+
+    Returns v2 data if available; falls back to legacy decisions otherwise.
+    """
+    sym = normalize_symbol(symbol)
+    limit_days = max(1, min(int(limit_days), 60))
+
+    with SessionLocal() as s:
+        # Prefer v2
+        q = (
+            select(models.ModelRecommendationV2, models.ModelRunV2)
+            .join(models.ModelRunV2, models.ModelRunV2.run_id == models.ModelRecommendationV2.run_id)
+            .where(models.ModelRecommendationV2.symbol == sym)
+            .order_by(models.ModelRecommendationV2.decision_day.desc())
+            .limit(limit_days)
+        )
+        rows = s.execute(q).all()
+
+        if rows:
+            recos: list[dict] = []
+            reco_ids = [r[0].reco_id for r in rows]
+            ev_rows = s.execute(
+                select(models.ModelRecommendationEvidenceV2)
+                .where(models.ModelRecommendationEvidenceV2.reco_id.in_(reco_ids))
+                .order_by(models.ModelRecommendationEvidenceV2.reco_id.asc(), models.ModelRecommendationEvidenceV2.importance.desc())
+            ).scalars().all()
+            ev_map: dict[int, list[dict]] = {}
+            for ev in ev_rows:
+                ev_map.setdefault(ev.reco_id, []).append(
+                    {
+                        "reason_code": ev.reason_code,
+                        "reason_text": ev.reason_text,
+                        "importance": int(ev.importance or 0),
+                        "evidence": ev.evidence or {},
+                        "refs": ev.refs or {},
+                    }
+                )
+
+            for reco, run in rows:
+                recos.append(
+                    {
+                        "decision_day": reco.decision_day,
+                        "cutoff_ts": reco.cutoff_ts.isoformat() if reco.cutoff_ts else None,
+                        "run": {
+                            "model_name": run.model_name,
+                            "model_version": run.model_version,
+                            "objective": run.objective,
+                            "horizon_days": int(run.horizon_days),
+                            "target_profit_low": float(run.target_profit_low),
+                            "target_profit_high": float(run.target_profit_high),
+                            "params": run.params or {},
+                            "label_version": run.label_version,
+                            "created_at": run.created_at.isoformat() if run.created_at else None,
+                        },
+                        "recommendation": {
+                            "action": reco.action,
+                            "score": float(reco.score),
+                            "confidence": float(reco.confidence),
+                            "signals": reco.signals or {},
+                            "lineage": reco.lineage or {},
+                            "created_at": reco.created_at.isoformat() if reco.created_at else None,
+                        },
+                        "evidence": ev_map.get(reco.reco_id, []),
+                    }
+                )
+
+            return {"symbol": sym, "mode": "v2", "trace": recos}
+
+        # Fallback: legacy decisions
+        q2 = (
+            select(models.ModelDecision)
+            .where(models.ModelDecision.symbol == sym)
+            .order_by(models.ModelDecision.decision_time.desc())
+            .limit(limit_days)
+        )
+        legacy = s.execute(q2).scalars().all()
+        if not legacy:
+            return {"symbol": sym, "mode": "none", "trace": []}
+
+        ids = [d.id for d in legacy]
+        ev_rows2 = s.execute(
+            select(models.DecisionEvidence)
+            .where(models.DecisionEvidence.decision_id.in_(ids))
+            .order_by(models.DecisionEvidence.decision_id.asc(), models.DecisionEvidence.importance.desc())
+        ).scalars().all()
+        ev_map2: dict[int, list[dict]] = {}
+        for ev in ev_rows2:
+            ev_map2.setdefault(ev.decision_id, []).append(
+                {
+                    "reason_code": ev.reason_code,
+                    "reason_text": ev.reason_text,
+                    "importance": int(ev.importance or 0),
+                    "evidence": ev.evidence_data or {},
+                }
+            )
+
+        trace = []
+        for d in legacy:
+            trace.append(
+                {
+                    "decision_time": d.decision_time.isoformat() if d.decision_time else None,
+                    "model_name": d.model_name,
+                    "model_version": d.model_version,
+                    "action": d.action,
+                    "score": float(d.score),
+                    "confidence": float(d.confidence),
+                    "evidence": ev_map2.get(d.id, []),
+                }
+            )
+
+        return {"symbol": sym, "mode": "legacy", "trace": trace}
+
+@router.post("/tasks/eod_1530")
+def task_eod_1530(trading_day: str | None = None) -> dict:
+    """Run 15:30 (Asia/Shanghai) cutoff materialization.
+
+    This endpoint is designed to be called by an external scheduler.
+    """
+    res = run_eod_cutoff_1530(trading_day=trading_day)
+    return {"ok": True, **res}

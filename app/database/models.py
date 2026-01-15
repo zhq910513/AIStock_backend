@@ -897,3 +897,292 @@ class SystemEvent(Base):
     time = Column(DateTime(timezone=True), nullable=False, index=True)
 
     __table_args__ = (Index("ix_system_events_type_time", "event_type", "time"),)
+
+# ==============================
+# Model V2 (Target-return within holding window)
+# ==============================
+
+class RawMarketPayload(Base):
+    """Raw market payloads from any upstream platform.
+
+    This table is the canonical lineage anchor for high-frequency and slow-changing facts.
+    All normalized fact rows should reference `raw_hash` where possible.
+
+    Notes:
+    - `raw_hash` is a deterministic hash of (provider, endpoint, symbol, data_ts, payload_sha256)
+      and is used as a stable reference in the UI for traceability.
+    - `schema_name` and `schema_version` describe the payload format to help future decoding.
+    """
+
+    __tablename__ = "raw_market_payload"
+
+    id = Column(Integer, primary_key=True)
+    provider = Column(String(64), nullable=False, index=True)  # e.g. baidu/ifind/eastmoney
+    endpoint = Column(String(128), nullable=False)  # e.g. quotation_minute_ab
+    symbol = Column(String(16), nullable=False, index=True)
+    trading_day = Column(String(10), nullable=True, index=True)  # YYYY-MM-DD (Asia/Shanghai)
+
+    data_ts = Column(DateTime, nullable=True, index=True)  # upstream data timestamp
+    ingest_ts = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    schema_name = Column(String(64), nullable=True)
+    schema_version = Column(String(32), nullable=True)
+
+    payload_sha256 = Column(String(64), nullable=False)
+    raw_hash = Column(String(64), nullable=False, unique=True, index=True)
+    payload = Column(JSON, nullable=False)
+
+
+class FactIntradayBar1m(Base):
+    """1-minute bar fact table (high-frequency)."""
+
+    __tablename__ = "fact_intraday_bar_1m"
+
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    trading_day = Column(String(10), nullable=False, index=True)
+    bar_ts = Column(DateTime, nullable=False, index=True)  # minute timestamp
+
+    open = Column(Float, nullable=True)
+    high = Column(Float, nullable=True)
+    low = Column(Float, nullable=True)
+    close = Column(Float, nullable=True)
+
+    volume = Column(BigInteger, nullable=True)
+    amount = Column(Float, nullable=True)
+
+    vwap = Column(Float, nullable=True)
+
+    raw_hash = Column(String(64), nullable=True, index=True)  # link to RawMarketPayload.raw_hash
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "bar_ts", name="uq_fact_intraday_bar_1m_symbol_ts"),
+        Index("ix_fact_intraday_bar_1m_symbol_day_ts", "symbol", "trading_day", "bar_ts"),
+    )
+
+
+class FactTradeTick(Base):
+    """Tick-by-tick trades fact table (high-frequency)."""
+
+    __tablename__ = "fact_trade_tick"
+
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    trading_day = Column(String(10), nullable=False, index=True)
+    trade_ts = Column(DateTime, nullable=False, index=True)
+
+    price = Column(Float, nullable=False)
+    volume = Column(BigInteger, nullable=False)
+
+    # bs_flag: 'B' buy, 'S' sell, 'N' unknown
+    bs_flag = Column(String(1), nullable=True)
+
+    # If upstream provides sequence/trade_id, store it for stable dedupe.
+    seq = Column(Integer, nullable=True)
+
+    raw_hash = Column(String(64), nullable=True, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "trade_ts", "seq", name="uq_fact_trade_tick_symbol_ts_seq"),
+        Index("ix_fact_trade_tick_symbol_day_ts", "symbol", "trading_day", "trade_ts"),
+    )
+
+
+class FactOrderBook5(Base):
+    """5-level order book snapshot fact table (high-frequency).
+
+    Each row represents a snapshot at `snapshot_ts`.
+    """
+
+    __tablename__ = "fact_orderbook_5"
+
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    trading_day = Column(String(10), nullable=False, index=True)
+    snapshot_ts = Column(DateTime, nullable=False, index=True)
+
+    bid1_price = Column(Float, nullable=True)
+    bid1_vol = Column(BigInteger, nullable=True)
+    bid2_price = Column(Float, nullable=True)
+    bid2_vol = Column(BigInteger, nullable=True)
+    bid3_price = Column(Float, nullable=True)
+    bid3_vol = Column(BigInteger, nullable=True)
+    bid4_price = Column(Float, nullable=True)
+    bid4_vol = Column(BigInteger, nullable=True)
+    bid5_price = Column(Float, nullable=True)
+    bid5_vol = Column(BigInteger, nullable=True)
+
+    ask1_price = Column(Float, nullable=True)
+    ask1_vol = Column(BigInteger, nullable=True)
+    ask2_price = Column(Float, nullable=True)
+    ask2_vol = Column(BigInteger, nullable=True)
+    ask3_price = Column(Float, nullable=True)
+    ask3_vol = Column(BigInteger, nullable=True)
+    ask4_price = Column(Float, nullable=True)
+    ask4_vol = Column(BigInteger, nullable=True)
+    ask5_price = Column(Float, nullable=True)
+    ask5_vol = Column(BigInteger, nullable=True)
+
+    raw_hash = Column(String(64), nullable=True, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "snapshot_ts", name="uq_fact_orderbook_5_symbol_ts"),
+        Index("ix_fact_orderbook_5_symbol_day_ts", "symbol", "trading_day", "snapshot_ts"),
+    )
+
+
+class FeatIntradayCutoff(Base):
+    """Derived intraday features at a specific cutoff timestamp (e.g. 15:30).
+
+    This is the feature row used by the model for that day.
+    """
+
+    __tablename__ = "feat_intraday_cutoff"
+
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    trading_day = Column(String(10), nullable=False, index=True)
+    cutoff_ts = Column(DateTime, nullable=False, index=True)
+
+    feature_hash = Column(String(64), nullable=False, index=True)
+    features = Column(JSON, nullable=False, default=dict)
+
+    # lineage summary
+    raw_hashes = Column(JSON, nullable=False, default=list)  # list[str]
+
+    created_ts = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "trading_day", "cutoff_ts", name="uq_feat_intraday_cutoff_symbol_day_cutoff"),
+    )
+
+
+class FeatDaily(Base):
+    """Slow-changing / daily features."""
+
+    __tablename__ = "feat_daily"
+
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    trading_day = Column(String(10), nullable=False, index=True)
+
+    feature_hash = Column(String(64), nullable=False, index=True)
+    features = Column(JSON, nullable=False, default=dict)
+
+    raw_hashes = Column(JSON, nullable=False, default=list)
+
+    created_ts = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "trading_day", name="uq_feat_daily_symbol_day"),
+    )
+
+
+class ModelRunV2(Base):
+    """A model run produces a batch of recommendations for a decision day.
+
+    The model objective is probability of hitting target return within holding window.
+    """
+
+    __tablename__ = "model_run_v2"
+
+    run_id = Column(String(64), primary_key=True)
+    model_name = Column(String(64), nullable=False, index=True)
+    model_version = Column(String(32), nullable=False)
+
+    decision_day = Column(String(10), nullable=False, index=True)  # the day user will buy (T+1)
+    asof_ts = Column(DateTime, nullable=False, index=True)  # data cutoff (e.g. 15:30 of T)
+
+    target_return_low = Column(Float, nullable=False, default=0.05)
+    target_return_high = Column(Float, nullable=False, default=0.08)
+    holding_days = Column(Integer, nullable=False, default=3)
+
+    params = Column(JSON, nullable=False, default=dict)
+    label_version = Column(String(64), nullable=True, index=True)
+
+    created_ts = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
+class ModelRecoV2(Base):
+    """Per-symbol recommendation within a model run."""
+
+    __tablename__ = "model_reco_v2"
+
+    reco_id = Column(Integer, primary_key=True)
+    run_id = Column(String(64), ForeignKey("model_run_v2.run_id"), nullable=False, index=True)
+
+    symbol = Column(String(16), nullable=False, index=True)
+
+    action = Column(String(16), nullable=False)  # BUY/WATCH/IGNORE
+    score = Column(Float, nullable=False)
+    confidence = Column(Float, nullable=False)
+
+    # primary objective outputs
+    p_hit_target = Column(Float, nullable=False)
+    expected_max_return = Column(Float, nullable=True)
+
+    # optional auxiliary predictions
+    p_limit_up_next_day = Column(Float, nullable=True)
+
+    # snapshot for UI
+    signals = Column(JSON, nullable=False, default=dict)
+
+    created_ts = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "symbol", name="uq_model_reco_v2_run_symbol"),
+    )
+
+
+class ModelRecoEvidenceV2(Base):
+    __tablename__ = "model_reco_evidence_v2"
+
+    id = Column(Integer, primary_key=True)
+    reco_id = Column(Integer, ForeignKey("model_reco_v2.reco_id"), nullable=False, index=True)
+
+    reason_code = Column(String(64), nullable=False, index=True)
+    reason_text = Column(Text, nullable=False)
+
+    evidence_fields = Column(JSON, nullable=False, default=dict)
+    evidence_refs = Column(JSON, nullable=False, default=dict)
+
+    created_ts = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        Index("ix_model_reco_evidence_v2_reco", "reco_id"),
+    )
+
+
+class OnlineFeedbackEventV2(Base):
+    """Online feedback / labels generated after market close.
+
+    This table supports continuous learning and backtest.
+    """
+
+    __tablename__ = "online_feedback_event_v2"
+
+    id = Column(Integer, primary_key=True)
+
+    symbol = Column(String(16), nullable=False, index=True)
+    decision_day = Column(String(10), nullable=False, index=True)  # day the position would be opened
+
+    holding_days = Column(Integer, nullable=False, default=3)
+    target_return_low = Column(Float, nullable=False, default=0.05)
+    target_return_high = Column(Float, nullable=False, default=0.08)
+
+    # realized outcomes
+    entry_price_ref = Column(Float, nullable=True)  # e.g. next-day open
+    max_return = Column(Float, nullable=True)
+    hit_target = Column(Boolean, nullable=True)
+    hit_day_offset = Column(Integer, nullable=True)  # 1..holding_days
+
+    label_version = Column(String(64), nullable=False, index=True)
+
+    # lineage
+    raw_refs = Column(JSON, nullable=False, default=dict)
+
+    created_ts = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "decision_day", "label_version", name="uq_online_feedback_event_v2_symbol_day_version"),
+    )

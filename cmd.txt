@@ -1,8 +1,9 @@
 tree /A /F > tree.txt
 
+
+
 cd /data/frontend/aistock_frontend/
 git pull
-
 
 cd /data/backend/aistock_backend/
 git pull
