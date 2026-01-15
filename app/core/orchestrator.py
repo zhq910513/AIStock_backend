@@ -11,9 +11,11 @@ from app.config import settings
 from app.database.engine import SessionLocal
 from app.database import models
 from app.core.recommender_v1 import generate_for_batch, persist_decisions
+from app.core.collector_pipeline import run_collectors_for_committed_batch
 from app.utils.crypto import sha256_hex
 from app.utils.symbols import normalize_symbol
 from app.utils.time import now_shanghai, trading_day_str
+from app.utils.trading_calendar import is_trading_day
 
 
 def _parse_hhmm(v: str, default: tuple[int, int]) -> tuple[int, int]:
@@ -184,6 +186,14 @@ class Orchestrator:
             return
 
         td = trading_day_str(now)
+        # Realtime-like pulls should respect trading days.
+        if getattr(settings, "REALTIME_ONLY_ON_TRADING_DAYS", True):
+            if not is_trading_day(td):
+                return
+
+        # Realtime-like task guard: only fetch on trading days.
+        if settings.REALTIME_ONLY_ON_TRADING_DAYS and (not is_trading_day(td)):
+            return
 
         with SessionLocal() as s:
             # already fetched today?
@@ -207,7 +217,9 @@ class Orchestrator:
             allowed_prefixes, allowed_exchanges, rules = get_pool_filter_rules(s)
         filtered = _filter_and_normalize_items(res.items, allowed_prefixes, allowed_exchanges)
 
-        batch_id = sha256_hex(f"{td}|{settings.POOL_FETCH_URL}|{res.raw_hash}".encode("utf-8"))[:32]
+        mode = str(getattr(settings, "POOL_FETCHER_MODE", "CUSTOM") or "CUSTOM").strip().upper()
+        src = settings.POOL_FETCH_URL if mode != "THS_10JQKA" else "THS_10JQKA"
+        batch_id = sha256_hex(f"{td}|{src}|{res.raw_hash}".encode("utf-8"))[:32]
 
         with SessionLocal() as s:
             s.add(
@@ -260,6 +272,9 @@ class Orchestrator:
             )
 
             for b in batches:
+                # Offline collectors (history/theme) - can run any day.
+                # Idempotent per (batch_id, step_name).
+                run_collectors_for_committed_batch(s, b)
                 items = generate_for_batch(s, b)
                 persist_decisions(s, b, items)
                 # idempotent: once decisions persisted, keep batch in COMMITTED

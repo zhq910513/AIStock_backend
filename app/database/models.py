@@ -12,6 +12,7 @@ from sqlalchemy import (
     BigInteger,
     String,
     UniqueConstraint,
+    PrimaryKeyConstraint,
 )
 from sqlalchemy import JSON
 from sqlalchemy.orm import declarative_base, relationship
@@ -416,6 +417,109 @@ class SymbolFeatureSnapshot(Base):
 
     __table_args__ = (
         Index("ix_feature_snapshots_symbol_asof", "symbol", "asof_ts"),
+    )
+
+
+# ---------------------------
+# Canonical Schema v1: normalized module tables (collector outputs)
+# ---------------------------
+
+
+class EquityEODSnapshot(Base):
+    """Daily EOD snapshot (行情) for a symbol."""
+
+    __tablename__ = "equity_eod_snapshot"
+
+    trading_day = Column(String(8), nullable=False)
+    symbol = Column(String(32), nullable=False)
+
+    prev_close = Column(Float, nullable=True)
+    open = Column(Float, nullable=True)
+    high = Column(Float, nullable=True)
+    low = Column(Float, nullable=True)
+    close = Column(Float, nullable=True)
+
+    volume = Column(Float, nullable=True)
+    amount = Column(Float, nullable=True)
+    turnover_rate = Column(Float, nullable=True)
+    amplitude = Column(Float, nullable=True)
+    float_market_cap = Column(Float, nullable=True)
+
+    is_limit_up_close = Column(Boolean, nullable=True)
+
+    source = Column(String(32), nullable=False, default="COLLECTOR")
+    raw_ref = Column(String(128), nullable=True)  # e.g. response sha / request id
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        PrimaryKeyConstraint("trading_day", "symbol", name="pk_equity_eod_snapshot"),
+        Index("ix_eod_symbol_day", "symbol", "trading_day"),
+    )
+
+
+class EquityThemeMap(Base):
+    """Theme/sector mapping for a symbol on a trading day."""
+
+    __tablename__ = "equity_theme_map"
+
+    trading_day = Column(String(8), nullable=False)
+    symbol = Column(String(32), nullable=False)
+    theme_id = Column(String(64), nullable=False)
+    theme_name = Column(String(128), nullable=False, default="")
+    theme_rank = Column(Integer, nullable=True)
+
+    source = Column(String(32), nullable=False, default="COLLECTOR")
+    raw_ref = Column(String(128), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        PrimaryKeyConstraint("trading_day", "symbol", "theme_id", name="pk_equity_theme_map"),
+        Index("ix_theme_map_symbol_day", "symbol", "trading_day"),
+        Index("ix_theme_map_theme_day", "theme_id", "trading_day"),
+    )
+
+
+class ThemeDailyStats(Base):
+    """Daily stats for a theme/sector."""
+
+    __tablename__ = "theme_daily_stats"
+
+    trading_day = Column(String(8), nullable=False)
+    theme_id = Column(String(64), nullable=False)
+
+    theme_name = Column(String(128), nullable=False, default="")
+    theme_strength_score = Column(Float, nullable=True)
+    limitup_count_in_theme = Column(Integer, nullable=True)
+
+    source = Column(String(32), nullable=False, default="COLLECTOR")
+    raw_ref = Column(String(128), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        PrimaryKeyConstraint("trading_day", "theme_id", name="pk_theme_daily_stats"),
+        Index("ix_theme_daily_stats_day", "trading_day"),
+    )
+
+
+class PipelineStep(Base):
+    """Idempotent pipeline step state per batch.
+
+    This avoids altering the LimitupPoolBatch schema while still making the pipeline
+    'exactly-once' per (batch_id, step_name).
+    """
+
+    __tablename__ = "pipeline_steps"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    batch_id = Column(String(64), nullable=False, index=True)
+    step_name = Column(String(64), nullable=False, index=True)
+    status = Column(String(16), nullable=False, default="PENDING")  # PENDING/RUNNING/DONE/FAILED
+    detail = Column(JSON, nullable=False, default=dict)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("batch_id", "step_name", name="uq_pipeline_step_batch_name"),
+        Index("ix_pipeline_steps_batch_status", "batch_id", "status"),
     )
 
 

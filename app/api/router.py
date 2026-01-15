@@ -15,6 +15,7 @@ from app.config import settings
 from app.core.labeling_planner import build_plan
 from app.adapters.pool_fetcher import fetch_limitup_pool
 from app.core.recommender_v1 import generate_for_batch, persist_decisions
+from app.core.collector_pipeline import run_collectors_for_committed_batch
 
 
 router = APIRouter()
@@ -246,7 +247,9 @@ def pool_fetch_now() -> dict:
     with SessionLocal() as s:
         allowed_prefixes, allowed_exchanges, rules = get_pool_filter_rules(s)
     filtered = _filter_and_normalize_items(res.items, allowed_prefixes, allowed_exchanges)
-    batch_id = sha256_hex(f"{td}|{settings.POOL_FETCH_URL}|{res.raw_hash}".encode("utf-8"))[:32]
+    mode = str(getattr(settings, "POOL_FETCHER_MODE", "CUSTOM") or "CUSTOM").strip().upper()
+    src = settings.POOL_FETCH_URL if mode != "THS_10JQKA" else "THS_10JQKA"
+    batch_id = sha256_hex(f"{td}|{src}|{res.raw_hash}".encode("utf-8"))[:32]
 
     with SessionLocal() as s:
         # idempotent: if exists, return existing summary
@@ -257,7 +260,7 @@ def pool_fetch_now() -> dict:
                     batch_id=batch_id,
                     trading_day=td,
                     fetch_ts=now_shanghai(),
-                    source="EXTERNAL",
+                    source=("THS_10JQKA" if mode == "THS_10JQKA" else "EXTERNAL"),
                     status="EDITING",
                     filter_rules=rules,
                     raw_hash=res.raw_hash,
@@ -316,15 +319,23 @@ def list_pool_batches(limit: int = 30, day: str | None = None) -> list[dict]:
 
 
 @router.get("/pool/batches/{batch_id}/candidates")
-def list_pool_candidates(batch_id: str, limit: int = 500) -> list[dict]:
+def list_pool_candidates(
+    batch_id: str,
+    limit: int = 500,
+    status: str | None = None,
+    include_all: bool = False,
+) -> list[dict]:
     with SessionLocal() as s:
+        # Default behavior is optimized for the editor UI:
+        # - hide already-edited candidates (READY/DROPPED) unless explicitly requested.
+        if not include_all and (status is None):
+            status = "PENDING_EDIT"
+
+        q = select(models.LimitupCandidate).where(models.LimitupCandidate.batch_id == batch_id)
+        if status:
+            q = q.where(models.LimitupCandidate.candidate_status == str(status).strip())
         rows = (
-            s.execute(
-                select(models.LimitupCandidate)
-                .where(models.LimitupCandidate.batch_id == batch_id)
-                .order_by(models.LimitupCandidate.p_limit_up.desc().nullslast())
-                .limit(limit)
-            )
+            s.execute(q.order_by(models.LimitupCandidate.p_limit_up.desc().nullslast()).limit(limit))
             .scalars()
             .all()
         )
@@ -430,6 +441,9 @@ def commit_pool_batch(batch_id: str) -> dict:
         # mark batch committed
         b.status = "COMMITTED"
         s.flush()
+
+        # Run offline collectors (history/theme) immediately for this committed batch.
+        run_collectors_for_committed_batch(s, b)
 
         # generate recommendations now
         items = generate_for_batch(s, b)

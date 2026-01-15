@@ -34,12 +34,25 @@ class Settings(BaseSettings):
     POOL_FETCH_AT_HHMM: str = "16:00"  # Asia/Shanghai
 
     # Candidate pool endpoint
+    # Pull mode:
+    # - THS_10JQKA: use https://data.10jqka.com.cn/dataapi/limit_up/continuous_limit_pool (fixed)
+    # - CUSTOM: use POOL_FETCH_URL/...
+    POOL_FETCHER_MODE: str = "THS_10JQKA"
+
+    # CUSTOM mode endpoint
     POOL_FETCH_URL: str = ""
     # Optional HTTP method: GET/POST
     POOL_FETCH_METHOD: str = "GET"
     # Optional headers/body as JSON strings (kept as str to avoid env parsing surprises)
     POOL_FETCH_HEADERS_JSON: str = "{}"
     POOL_FETCH_BODY_JSON: str = "{}"
+
+    # THS_10JQKA mode params (can be overridden via env)
+    THS_POOL_LIMIT: int = 200
+    THS_POOL_FIELDS: str = "199112,10,330329,330325,133971,133970,1968584,3475914,3541450,9004"
+    THS_POOL_FILTER: str = "HS,GEM2STAR"
+    THS_POOL_ORDER_FIELD: str = "330329"
+    THS_POOL_ORDER_TYPE: str = "0"
 
     # Filter rules (configurable)
     POOL_ALLOWED_PREFIXES: str = "0"          # e.g. "0" or "0,6"
@@ -51,9 +64,24 @@ class Settings(BaseSettings):
     # - VERSIONED: read from pool_filter_rule_sets (effective_ts based), fallback to DB/ENV
     POOL_RULES_SOURCE: str = "ENV"
 
+    # --- Trading calendar (P0: weekend + configurable holidays) ---
+    # Comma-separated YYYYMMDD. Used only for guarding realtime fetches and mapping history days.
+    TRADING_HOLIDAYS: str = ""
+    # If true, realtime-like pulls (e.g. 16:00 candidate pool) will be skipped on non-trading days.
+    REALTIME_ONLY_ON_TRADING_DAYS: bool = True
+
     # --- Recommendation output ---
     RECOMMEND_TOPN: int = 10
     RECOMMEND_DEADLINE_HHMM: str = "08:30"    # T+1 deadline
+
+    # --- Offline collectors (history/theme) ---
+    # How many trading days of EOD history to fetch for each symbol when a batch is committed.
+    HISTORY_LOOKBACK_DAYS: int = 60
+
+    # Theme/Sector collector (optional; provider-specific)
+    # If not configured, the theme step will be marked DONE (skipped) but no rows are written.
+    THEME_PROVIDER: str = ""            # e.g. IFIND_HTTP
+    THEME_ENDPOINT_MAP: str = ""        # provider endpoint name for mapping
 
     IFIND_HTTP_BASE_URL: str = "https://quantapi.51ifind.com"
     IFIND_HTTP_REFRESH_TOKEN: str = ""
