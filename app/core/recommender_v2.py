@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from decimal import Decimal
 from math import exp, log
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,6 +31,18 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import models
+from sqlalchemy import select
+
+# LightGBM model runtime
+import lightgbm as lgb
+from app.core.model_training import (
+    OBJ_TP5_3D,
+    OBJ_TP8_3D,
+    build_features_from_snapshot,
+    predict_contrib,
+    predict_proba,
+)
+from app.utils.symbols import normalize_symbol
 
 
 def _next_day_yyyymmdd(td: str) -> str:
@@ -94,6 +107,36 @@ class CandidateView:
     high_days: Any = None
     limit_up_type: str = ""
     change_rate: Any = None
+
+
+@dataclass
+class _MLContext:
+    tp5_booster: Optional[lgb.Booster]
+    tp5_features: list[str]
+    tp8_booster: Optional[lgb.Booster]
+    tp8_features: list[str]
+
+
+def _load_active_ml_context(db: Session) -> _MLContext:
+    def _load(obj: str) -> tuple[Optional[lgb.Booster], list[str]]:
+        row = db.execute(
+            select(models.ModelArtifact)
+            .where(models.ModelArtifact.objective == obj, models.ModelArtifact.is_active == True)  # noqa: E712
+            .order_by(models.ModelArtifact.trained_ts.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if row is None:
+            return None, []
+        try:
+            b = lgb.Booster(model_str=row.artifact_text)
+            fl = list(row.feature_list or [])
+            return b, fl
+        except Exception:
+            return None, []
+
+    tp5_b, tp5_f = _load(OBJ_TP5_3D)
+    tp8_b, tp8_f = _load(OBJ_TP8_3D)
+    return _MLContext(tp5_booster=tp5_b, tp5_features=tp5_f, tp8_booster=tp8_b, tp8_features=tp8_f)
 
 
 
@@ -249,6 +292,110 @@ def score_candidate(
     )
 
 
+def score_candidate_with_ml(
+    c: models.LabelingCandidate,
+    target_low: float,
+    target_high: float,
+    holding_days: int,
+    ml: _MLContext,
+) -> ScoredCandidate:
+    """Score candidate using active LightGBM models when available.
+
+    If either model is missing, fall back to the baseline scorer.
+    """
+    if ml.tp5_booster is None or ml.tp8_booster is None or not ml.tp5_features or not ml.tp8_features:
+        return score_candidate(c, target_low=target_low, target_high=target_high, holding_days=holding_days)
+
+    symbol = normalize_symbol(c.symbol)
+
+    extra = getattr(c, "extra", None) or {}
+    snapshot = {
+        "p_limit_up": getattr(c, "p_limit_up", None),
+        "high_days": extra.get("high_days") or extra.get("high_days_n") or extra.get("high_days_text"),
+        "turnover_rate": extra.get("turnover_rate"),
+        "order_amount": extra.get("order_amount") or extra.get("order_volume"),
+        "sum_market_value": extra.get("sum_market_value") or extra.get("currency_value"),
+        "is_again_limit": extra.get("is_again_limit"),
+        "change_rate": extra.get("change_rate"),
+        "limit_up_type": extra.get("limit_up_type"),
+    }
+
+    feats = build_features_from_snapshot(snapshot)
+    p5 = predict_proba(ml.tp5_booster, ml.tp5_features, feats)
+    p8 = predict_proba(ml.tp8_booster, ml.tp8_features, feats)
+
+    # score/action mapping (contract-driven)
+    score_raw = 100.0 * (0.6 * p8 + 0.4 * p5)
+
+    # simple tradeability penalty (non-label, proxy-only)
+    penalty = 0.0
+    lut = str(snapshot.get("limit_up_type") or "").strip()
+    if "一字" in lut:
+        penalty += 12.0
+    tr = _to_float(snapshot.get("turnover_rate"), default=0.0)
+    if tr <= 0.2:
+        penalty += 3.0
+    final_score = round(max(0.0, score_raw - penalty), 2)
+
+    if final_score >= 70.0:
+        action = "买入"
+    elif final_score >= 55.0:
+        action = "观察"
+    else:
+        action = "忽略"
+
+    confidence = round(float(max(p5, p8)), 6)
+    exp_max = max(0.0, min(0.25, (0.6 * p8 + 0.4 * p5) * (target_high + 0.02)))
+
+    signals: Dict[str, Any] = {
+        "p_tp5_3d": round(p5, 6),
+        "p_tp8_3d": round(p8, 6),
+        "score": final_score,
+        "penalty": round(penalty, 2),
+        "target_return_low": target_low,
+        "target_return_high": target_high,
+        "holding_days": holding_days,
+        "feature_schema_version": str(settings.FEATURE_EXTRACTOR_VERSION or "v1"),
+    }
+
+    evidence: List[Tuple[str, str, Dict[str, Any]]] = []
+    evidence.append(
+        (
+            "MODEL_LGBM_TP5_TP8",
+            "LightGBM 双头模型输出（以 Open(T+1) 入场、三日内能否达到 +5%/+8%）",
+            {"p_tp5_3d": round(p5, 6), "p_tp8_3d": round(p8, 6), "score": final_score},
+        )
+    )
+
+    # top factor contributions from TP8 head (more selective)
+    try:
+        contrib = predict_contrib(ml.tp8_booster, ml.tp8_features, feats)
+        top = sorted(contrib.items(), key=lambda kv: abs(kv[1]), reverse=True)[:6]
+        evidence.append(
+            (
+                "TOP_FEATURE_CONTRIB",
+                "本次决策变化的主要因子贡献（TP8 头，按绝对贡献排序）",
+                {"top": [{"feature": k, "contrib": float(v), "value": float(feats.get(k, 0.0))} for k, v in top]},
+            )
+        )
+    except Exception:
+        pass
+
+    evidence.append(("RAW_SNAPSHOT", "候选池原始字段快照（用于追溯）", snapshot))
+
+    return ScoredCandidate(
+        symbol=symbol,
+        action=action,
+        score=final_score,
+        confidence=confidence,
+        p_hit_target=float(0.6 * p8 + 0.4 * p5),
+        expected_max_return=exp_max,
+        p_limit_up_next_day=_to_float(getattr(c, "p_limit_up", None), default=None),
+        signals=signals,
+        evidence=evidence,
+    )
+
+
 # ---------------------------
 # Native v2 persistence (NOT yet wired to APIs)
 # ---------------------------
@@ -379,8 +526,13 @@ def generate_for_batch_run_v2(
 # ---------------------------
 
 # Reuse v1 decision tables for now (ModelDecision / DecisionEvidence)
+import uuid
+from datetime import date, time
+
 from app.core.recommender_v1 import EvidenceItem, RecommendationItem  # noqa: E402
-from app.core import recommender_v1 as _reco_v1  # noqa: E402
+from app.utils.crypto import sha256_hex  # noqa: E402
+from app.utils.trading_calendar import next_n_trading_days  # noqa: E402
+from app.utils.time import now_shanghai, SH_TZ  # noqa: E402
 
 
 def generate_for_batch_v2(
@@ -388,15 +540,109 @@ def generate_for_batch_v2(
     batch: models.LimitupPoolBatch,
     topn: int | None = None,
 ) -> list[RecommendationItem]:
-    """Generate recommendation items (API-compatible).
+    """Generate recommendation items (API-compatible, but model-driven).
 
-    Current UI endpoints read from ModelDecision/DecisionEvidence.
-    To keep the container runnable and the endpoints consistent, we delegate to v1.
-
-    When UI switches to v2 tables, replace this with native v2 logic.
+    This uses the active LightGBM artifacts (TP5/TP8) when present.
+    It still outputs RecommendationItem so current UI endpoints keep working.
     """
 
-    return _reco_v1.generate_for_batch(s, batch, topn=topn)
+    n = int(topn or settings.RECOMMEND_TOPN or 10)
+    target_low = float(getattr(settings, "TARGET_RETURN_LOW", 0.05) or 0.05)
+    target_high = float(getattr(settings, "TARGET_RETURN_HIGH", 0.08) or 0.08)
+    holding_days = int(getattr(settings, "HOLDING_DAYS", 3) or 3)
+
+    # Load active ML artifacts once
+    ml = _load_active_ml_context(s)
+
+    rows = (
+        s.execute(
+            select(models.LimitupCandidate)
+            .where(models.LimitupCandidate.batch_id == batch.batch_id)
+            .where(models.LimitupCandidate.candidate_status != "DROPPED")
+        )
+        .scalars()
+        .all()
+    )
+
+    decision_day = _next_day_yyyymmdd(batch.trading_day)
+
+    class _Cand:
+        def __init__(self, symbol: str, p_limit_up: float | None, extra: dict | None):
+            self.symbol = symbol
+            self.p_limit_up = p_limit_up
+            self.extra = extra or {}
+
+    items: list[tuple[ScoredCandidate, models.LimitupCandidate]] = []
+    for r in rows:
+        cand = _Cand(symbol=r.symbol, p_limit_up=getattr(r, "p_limit_up", None), extra=dict(r.raw_json or {}))
+        scored = score_candidate_with_ml(cand, target_low=target_low, target_high=target_high, holding_days=holding_days, ml=ml)
+        items.append((scored, r))
+
+    # Sort by score then confidence
+    items.sort(key=lambda x: (float(x[0].score), float(x[0].confidence)), reverse=True)
+    kept = items[:n]
+
+    out: list[RecommendationItem] = []
+    for scored, r in kept:
+        act = scored.action
+        if act in ("买入", "BUY"):
+            action = "BUY"
+        elif act in ("观察", "WATCH"):
+            action = "WATCH"
+        else:
+            action = "AVOID"
+
+        # deterministic decision_id
+        decision_id = sha256_hex(
+            f"{batch.trading_day}|{decision_day}|{normalize_symbol(r.symbol)}|{float(scored.score):.4f}|{action}".encode("utf-8")
+        )[:64]
+
+        refs_base = {
+            "batch_id": batch.batch_id,
+            "candidate_id": r.id,
+            "candidate_symbol": r.symbol,
+            "raw_hash": batch.raw_hash,
+            "model": {
+                "tp5_active": bool(ml.tp5_booster is not None),
+                "tp8_active": bool(ml.tp8_booster is not None),
+            },
+        }
+
+        evs: list[EvidenceItem] = []
+        for reason_code, reason_text, fields in scored.evidence:
+            evs.append(
+                EvidenceItem(
+                    reason_code=str(reason_code),
+                    reason_text=str(reason_text),
+                    evidence_fields=dict(fields or {}),
+                    evidence_refs=refs_base,
+                )
+            )
+
+        # pad evidence to >=3 for UI consistency
+        while len(evs) < 3:
+            evs.append(
+                EvidenceItem(
+                    reason_code="EVIDENCE_PADDING",
+                    reason_text="证据不足（已按最小可追溯集输出）",
+                    evidence_fields=scored.signals,
+                    evidence_refs=refs_base,
+                )
+            )
+
+        out.append(
+            RecommendationItem(
+                decision_id=decision_id,
+                symbol=normalize_symbol(r.symbol),
+                name=str(r.name or ""),
+                action=action,
+                score=float(scored.score),
+                confidence=float(scored.confidence),
+                evidence=evs,
+            )
+        )
+
+    return out
 
 
 def persist_decisions_v2(
@@ -404,6 +650,171 @@ def persist_decisions_v2(
     batch: models.LimitupPoolBatch,
     items: list[RecommendationItem],
 ) -> None:
-    """Persist decisions/evidence (API-compatible)."""
+    """Persist decisions/evidence + write audit-first snapshot tables."""
+
+    # 1) Legacy persistence (keeps current API endpoints stable)
+    from app.core import recommender_v1 as _reco_v1  # local import to avoid cycles
 
     _reco_v1.persist_decisions(s, batch, items)
+
+    # 2) Snapshot / Trajectory persistence (new schema)
+    try:
+        t_day = datetime.strptime(batch.trading_day, "%Y%m%d").date()
+    except Exception:
+        return
+
+    cutoff_ts = datetime.combine(t_day, time(15, 30, 0), tzinfo=SH_TZ)
+    gen_ts = now_shanghai()
+
+    # Best-effort model_version for snapshots: tie to active artifact versions if present
+    try:
+        tp5_ver = s.execute(
+            select(models.ModelArtifact.model_version)
+            .where(models.ModelArtifact.objective == OBJ_TP5_3D, models.ModelArtifact.is_active == True)  # noqa: E712
+            .order_by(models.ModelArtifact.trained_ts.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        tp8_ver = s.execute(
+            select(models.ModelArtifact.model_version)
+            .where(models.ModelArtifact.objective == OBJ_TP8_3D, models.ModelArtifact.is_active == True)  # noqa: E712
+            .order_by(models.ModelArtifact.trained_ts.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        model_version = f"tp5:{tp5_ver or 'NA'}|tp8:{tp8_ver or 'NA'}"
+    except Exception:
+        model_version = "baseline"
+
+    # compute sellable days with calendar (fallback weekend-only)
+    try:
+        t1, t2, t3 = next_n_trading_days(t_day, 3, session=s)
+    except Exception:
+        # fallback: naive
+        t1, t2, t3 = t_day, t_day, t_day
+
+    for it in items:
+        inst = normalize_symbol(it.symbol)
+        window_id: str | None = None
+        if it.action == "BUY":
+            # create or reuse window for the same (instrument, signal_day_T)
+            existing = s.execute(
+                select(models.TradeWindow).where(
+                    models.TradeWindow.instrument_id == inst,
+                    models.TradeWindow.signal_day_T == t_day,
+                    models.TradeWindow.status == "OPEN",
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                window_id = str(uuid.uuid4())
+                s.add(
+                    models.TradeWindow(
+                        window_id=window_id,
+                        instrument_id=inst,
+                        signal_day_T=t_day,
+                        entry_ref_type="OPEN_T+1",
+                        entry_ref_px=None,
+                        sellable_start_day=t1,
+                        sellable_end_day=t3,
+                        status="OPEN",
+                        close_reason=None,
+                        created_ts=gen_ts,
+                    )
+                )
+                s.flush()
+            else:
+                window_id = existing.window_id
+
+        # pull p_tp5/p_tp8 from evidence if present
+        p_tp5 = None
+        p_tp8 = None
+        score = None
+        for ev in it.evidence:
+            if ev.reason_code == "MODEL_LGBM_TP5_TP8":
+                p_tp5 = ev.evidence_fields.get("p_tp5_3d")
+                p_tp8 = ev.evidence_fields.get("p_tp8_3d")
+                score = ev.evidence_fields.get("score")
+
+        snapshot_id = str(uuid.uuid4())
+        snap = models.ModelPredictionSnapshot(
+            snapshot_id=snapshot_id,
+            window_id=window_id,
+            batch_id=str(batch.batch_id),
+            instrument_id=inst,
+            asof_day=t_day,
+            cutoff_ts=cutoff_ts,
+            generated_ts=gen_ts,
+            action=str(it.action),
+            score=Decimal(str(score)) if score is not None else Decimal(str(it.score)),
+            p_tp5_3d=Decimal(str(p_tp5)) if p_tp5 is not None else None,
+            p_tp8_3d=Decimal(str(p_tp8)) if p_tp8 is not None else None,
+            p_tp5_nextday=None,
+            p_tp8_nextday=None,
+            expected_best_day=None,
+            confidence=Decimal(str(it.confidence)),
+            model_version=str(model_version),
+            feature_schema_version=str(settings.FEATURE_EXTRACTOR_VERSION or "v1"),
+            data_lineage={"batch_id": batch.batch_id, "raw_hash": batch.raw_hash},
+            quality_flags={},
+        )
+        s.add(snap)
+        s.flush()
+
+        # Evidence mirror into new evidence table (best-effort)
+        for ev in it.evidence:
+            s.add(
+                models.ModelSnapshotEvidence(
+                    snapshot_id=snapshot_id,
+                    reason_code=str(ev.reason_code),
+                    reason_text=str(ev.reason_text),
+                    evidence_payload=dict(ev.evidence_fields or {}),
+                    refs=dict(ev.evidence_refs or {}),
+                    importance=None,
+                    created_ts=gen_ts,
+                )
+            )
+
+        # Dependency: at least tie back to batch raw hash
+        s.add(
+            models.SnapshotDataDependency(
+                snapshot_id=snapshot_id,
+                dep_type="RAW_HASH",
+                ref_table="limitup_pool_batches",
+                ref_keys={"batch_id": batch.batch_id},
+                time_range_start=None,
+                time_range_end=None,
+                raw_hash=batch.raw_hash,
+                note="candidate pool source",
+            )
+        )
+
+        # Delta: link to previous snapshot by instrument (same model_version)
+        prev = s.execute(
+            select(models.ModelPredictionSnapshot)
+            .where(
+                models.ModelPredictionSnapshot.instrument_id == inst,
+                models.ModelPredictionSnapshot.model_version == str(model_version),
+                models.ModelPredictionSnapshot.cutoff_ts < cutoff_ts,
+            )
+            .order_by(models.ModelPredictionSnapshot.cutoff_ts.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if prev is not None:
+            try:
+                dp5 = (Decimal(str(p_tp5)) - Decimal(str(prev.p_tp5_3d))) if (p_tp5 is not None and prev.p_tp5_3d is not None) else None
+                dp8 = (Decimal(str(p_tp8)) - Decimal(str(prev.p_tp8_3d))) if (p_tp8 is not None and prev.p_tp8_3d is not None) else None
+                ds = (Decimal(str(score)) - Decimal(str(prev.score))) if (score is not None and prev.score is not None) else None
+            except Exception:
+                dp5 = dp8 = ds = None
+            s.add(
+                models.ModelSnapshotDelta(
+                    snapshot_id=snapshot_id,
+                    prev_snapshot_id=prev.snapshot_id,
+                    delta_p_tp5=dp5,
+                    delta_p_tp8=dp8,
+                    delta_score=ds,
+                    top_changed_factors=[],
+                    n_new_raw_payloads=None,
+                    summary_text=None,
+                )
+            )
+
+    s.commit()

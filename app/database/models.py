@@ -16,6 +16,9 @@ from sqlalchemy import (
     UniqueConstraint,
     PrimaryKeyConstraint,
     Text,
+    Numeric,
+    Date,
+    SmallInteger,
 )
 from sqlalchemy import JSON
 from sqlalchemy.orm import declarative_base, relationship
@@ -1188,4 +1191,307 @@ class OnlineFeedbackEventV2(Base):
 
     __table_args__ = (
         UniqueConstraint("symbol", "decision_day", "label_version", name="uq_online_feedback_event_v2_symbol_day_version"),
+    )
+
+
+# ==============================
+# Model training baseline tables (TP5/TP8, Open(T+1) entry)
+# ==============================
+
+
+class TradingCalendarDay(Base):
+    """Exchange trading calendar.
+
+    P0: allow empty table and fall back to weekend-only logic in utils.
+    When populated, it becomes the source of truth for T+1/T+2/T+3.
+    """
+
+    __tablename__ = "trading_calendar_day"
+
+    day = Column(Date, primary_key=True)
+    is_open = Column(Boolean, nullable=False, default=True, index=True)
+    note = Column(String(128), nullable=True)
+
+
+class FactDailyOHLCV(Base):
+    """Daily OHLCV fact table.
+
+    Hard requirement for labels:
+    - entry_px = Open(T+1)
+    - max_future_high_3d = max(High(T+1..T+3))
+    """
+
+    __tablename__ = "fact_daily_ohlcv"
+
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
+
+    instrument_id = Column(String(16), nullable=False, index=True)
+    trading_day = Column(Date, nullable=False, index=True)
+
+    open = Column(Numeric(18, 6), nullable=False)
+    high = Column(Numeric(18, 6), nullable=False)
+    low = Column(Numeric(18, 6), nullable=False)
+    close = Column(Numeric(18, 6), nullable=False)
+
+    volume = Column(Numeric(20, 3), nullable=True)
+    amount = Column(Numeric(20, 2), nullable=True)
+
+    source = Column(String(32), nullable=False, default="UNKNOWN")
+    raw_hash = Column(String(64), nullable=True, index=True)
+
+    created_ts = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("instrument_id", "trading_day", name="uq_fact_daily_ohlcv_inst_day"),
+        Index("ix_fact_daily_ohlcv_day", "trading_day"),
+    )
+
+
+class ModelTrainingLabel3D(Base):
+    """Training labels for 3-day window, anchored at Open(T+1).
+
+    Sample key: (instrument_id, signal_day_T, cutoff_ts, label_version)
+    Labels (main):
+      tp5_3d / tp8_3d based on max High in T+1..T+3 vs entry Open(T+1)
+    Labels (aux):
+      liquidity_ok / gap_risk / limitup_lock
+    """
+
+    __tablename__ = "model_training_label_3d"
+
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
+
+    instrument_id = Column(String(16), nullable=False, index=True)
+    signal_day_T = Column(Date, nullable=False, index=True)
+    cutoff_ts = Column(DateTime(timezone=True), nullable=False, index=True)
+
+    entry_day = Column(Date, nullable=False, index=True)
+    entry_px = Column(Numeric(18, 6), nullable=False)
+    max_future_high_3d = Column(Numeric(18, 6), nullable=False)
+
+    label_tp5_3d = Column(Boolean, nullable=False)
+    label_tp8_3d = Column(Boolean, nullable=False)
+
+    label_liquidity_ok = Column(Boolean, nullable=True)
+    label_gap_risk = Column(Boolean, nullable=True)
+    label_limitup_lock = Column(Boolean, nullable=True)
+
+    label_version = Column(String(64), nullable=False, index=True)
+    raw_refs = Column(JSON, nullable=False, default=dict)
+
+    created_ts = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("instrument_id", "signal_day_T", "cutoff_ts", "label_version", name="uq_label3d_inst_day_cutoff_ver"),
+        Index("ix_label3d_inst_day", "instrument_id", "signal_day_T"),
+    )
+
+
+class ModelArtifact(Base):
+    """Stored ML artifacts (LightGBM Booster model string).
+
+    We store Booster as text (model_to_string) for portability across runtimes.
+    Activation is enforced in code (one active per objective).
+    """
+
+    __tablename__ = "model_artifact"
+
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
+
+    objective = Column(String(32), nullable=False, index=True)  # TP5_3D / TP8_3D
+    model_version = Column(String(64), nullable=False, index=True)
+    feature_schema_version = Column(String(64), nullable=False, default="v1", index=True)
+
+    is_active = Column(Boolean, nullable=False, default=False, index=True)
+    trained_ts = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow, index=True)
+
+    metrics = Column(JSON, nullable=False, default=dict)
+    feature_list = Column(JSON, nullable=False, default=list)
+
+    artifact_text = Column(Text, nullable=False)
+    artifact_sha256 = Column(String(64), nullable=False, index=True)
+
+    note = Column(String(256), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("objective", "model_version", name="uq_model_artifact_obj_ver"),
+        Index("ix_model_artifact_obj_active", "objective", "is_active"),
+    )
+
+
+# ==============================
+# Snapshot / Cutoff / Trajectory (Audit-first)
+# ==============================
+
+class TradeWindow(Base):
+    """A holding/observation window for a single instrument (T~T+3).
+
+    Created when an instrument is selected as BUY-worthy on signal_day_T.
+    The window binds all subsequent snapshots together so UI never mixes batches.
+
+    Notes:
+    - We store UUIDs as string for cross-db portability.
+    """
+
+    __tablename__ = "trade_window"
+
+    window_id = Column(String(36), primary_key=True)
+
+    instrument_id = Column(String(16), nullable=False, index=True)
+    signal_day_T = Column(Date, nullable=False, index=True)
+
+    entry_ref_type = Column(String(32), nullable=False)  # CLOSE/VWAP_TAIL30/...
+    entry_ref_px = Column(Numeric(18, 6), nullable=True)
+
+    sellable_start_day = Column(Date, nullable=False, index=True)
+    sellable_end_day = Column(Date, nullable=False, index=True)
+
+    status = Column(String(16), nullable=False, default="OPEN", index=True)  # OPEN/CLOSED/EXPIRED
+    close_reason = Column(String(32), nullable=True)  # TP5/TP8/EXPIRED/MANUAL
+
+    created_ts = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        Index("ix_trade_window_instrument_signal_day", "instrument_id", "signal_day_T"),
+        Index("ix_trade_window_status_sellable_end", "status", "sellable_end_day"),
+    )
+
+
+class ModelPredictionSnapshot(Base):
+    """Prediction snapshot time series (supports multiple per day).
+
+    Key idea:
+    - Snapshot: model outputs at a moment
+    - Cutoff: data visibility boundary (anti-leakage)
+    - Trajectory: snapshots chained within a TradeWindow
+
+    Uniqueness:
+    - For a given instrument/asof_day/cutoff_ts/model_version there should be at most one snapshot.
+    """
+
+    __tablename__ = "model_prediction_snapshot"
+
+    snapshot_id = Column(String(36), primary_key=True)
+
+    window_id = Column(String(36), ForeignKey("trade_window.window_id", ondelete="SET NULL"), nullable=True, index=True)
+    batch_id = Column(String(64), nullable=True, index=True)
+
+    instrument_id = Column(String(16), nullable=False, index=True)
+
+    # The trading day this snapshot belongs to (T/T+1/T+2/...)
+    asof_day = Column(Date, nullable=False, index=True)
+
+    # data cutoff boundary, e.g. 2026-01-15 15:30:00+08
+    cutoff_ts = Column(DateTime(timezone=True), nullable=False, index=True)
+
+    # when model finished running
+    generated_ts = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow, index=True)
+
+    # Core outputs
+    action = Column(String(24), nullable=False)  # BUY/WATCH/HOLD/EXIT_CANDIDATE/...
+    score = Column(Numeric(8, 2), nullable=True)
+
+    p_tp5_3d = Column(Numeric(8, 6), nullable=True)
+    p_tp8_3d = Column(Numeric(8, 6), nullable=True)
+
+    p_tp5_nextday = Column(Numeric(8, 6), nullable=True)
+    p_tp8_nextday = Column(Numeric(8, 6), nullable=True)
+
+    expected_best_day = Column(SmallInteger, nullable=True)  # 1/2/3
+    confidence = Column(Numeric(8, 6), nullable=True)
+
+    # Versioning & lineage
+    model_version = Column(String(64), nullable=False, index=True)
+    feature_schema_version = Column(String(64), nullable=False, default="v1", index=True)
+
+    data_lineage = Column(JSON, nullable=False, default=dict)
+    quality_flags = Column(JSON, nullable=False, default=dict)
+
+    __table_args__ = (
+        UniqueConstraint("instrument_id", "asof_day", "cutoff_ts", "model_version", name="uq_pred_snapshot_inst_day_cutoff_ver"),
+        Index("ix_pred_snapshot_window_cutoff", "window_id", "cutoff_ts"),
+        Index("ix_pred_snapshot_inst_cutoff", "instrument_id", "cutoff_ts"),
+    )
+
+
+class ModelSnapshotEvidence(Base):
+    """Full evidence list for a snapshot (importance-ranked).
+
+    We keep evidence as a separate table so UI can fetch + sort efficiently.
+    """
+
+    __tablename__ = "model_snapshot_evidence"
+
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
+
+    snapshot_id = Column(String(36), ForeignKey("model_prediction_snapshot.snapshot_id", ondelete="CASCADE"), nullable=False, index=True)
+
+    reason_code = Column(String(64), nullable=False, index=True)
+    reason_text = Column(Text, nullable=False)
+
+    evidence_payload = Column(JSON, nullable=False, default=dict)
+    refs = Column(JSON, nullable=False, default=dict)
+
+    importance = Column(Numeric(8, 6), nullable=True)
+
+    created_ts = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        Index("ix_model_snapshot_evidence_snapshot", "snapshot_id"),
+    )
+
+
+class ModelSnapshotDelta(Base):
+    """Delta summary between a snapshot and its previous snapshot.
+
+    Used by UI trajectory view: show how/why probability changed.
+    """
+
+    __tablename__ = "model_snapshot_delta"
+
+    snapshot_id = Column(String(36), ForeignKey("model_prediction_snapshot.snapshot_id", ondelete="CASCADE"), primary_key=True)
+    prev_snapshot_id = Column(String(36), ForeignKey("model_prediction_snapshot.snapshot_id", ondelete="SET NULL"), nullable=True, index=True)
+
+    delta_p_tp5 = Column(Numeric(8, 6), nullable=True)
+    delta_p_tp8 = Column(Numeric(8, 6), nullable=True)
+    delta_score = Column(Numeric(8, 2), nullable=True)
+
+    top_changed_factors = Column(JSON, nullable=False, default=list)
+    n_new_raw_payloads = Column(Integer, nullable=False, default=0)
+
+    summary_text = Column(String(512), nullable=False, default="")
+
+
+class SnapshotDataDependency(Base):
+    """Structured dependency list for a snapshot.
+
+    This is the audit-friendly substitute for a single raw_hash string.
+    Each row points to one dependency: a table range, raw_hash, feature set, or external event.
+
+    For cross-db portability, `time_range_start` and `time_range_end` are used instead of tstzrange.
+    """
+
+    __tablename__ = "snapshot_data_dependency"
+
+    id = Column(AUTO_PK, primary_key=True, autoincrement=True)
+
+    snapshot_id = Column(String(36), ForeignKey("model_prediction_snapshot.snapshot_id", ondelete="CASCADE"), nullable=False, index=True)
+
+    dep_type = Column(String(32), nullable=False)  # TABLE_RANGE/RAW_HASH/FEATURE_SET/EXTERNAL_EVENT
+
+    ref_table = Column(String(128), nullable=True)
+    ref_keys = Column(JSON, nullable=False, default=dict)
+
+    time_range_start = Column(DateTime(timezone=True), nullable=True)
+    time_range_end = Column(DateTime(timezone=True), nullable=True)
+
+    raw_hash = Column(String(64), nullable=True, index=True)
+
+    note = Column(String(512), nullable=False, default="")
+
+    created_ts = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        Index("ix_snapshot_dep_snapshot", "snapshot_id"),
+        Index("ix_snapshot_dep_raw_hash", "raw_hash"),
     )

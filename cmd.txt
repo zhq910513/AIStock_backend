@@ -1,17 +1,24 @@
+# 生成文件树
 tree /A /F > tree.txt
 
 
 
+# 1) 获取最新前端代码
 cd /data/frontend/aistock_frontend/
 git pull
 
+# 2) 重新加载 nginx
+nginx -t && systemctl reload nginx
+
+# 3) 获取最新后端代码
 cd /data/backend/aistock_backend/
 git pull
 
+# 4) 重启后端容器
 cd /data/compose/aistock
+docker compose down
 docker compose build --no-cache
 docker compose up -d
 
-
-
-docker logs --tail=120 aistock_backend
+# 4) 看日志
+docker logs --tail=200 aistock_backend

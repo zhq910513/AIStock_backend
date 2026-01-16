@@ -17,6 +17,15 @@ from app.adapters.pool_fetcher import fetch_limitup_pool
 from app.core.recommender_v2 import generate_for_batch_v2, persist_decisions_v2
 from app.core.collector_pipeline import run_collectors_for_committed_batch
 from app.core.cutoff_tasks import run_eod_cutoff_1530
+from app.core.model_training import (
+    ensure_labels_for_candidates,
+    train_objective_lightgbm,
+    OBJ_TP5_3D,
+    OBJ_TP8_3D,
+)
+
+from decimal import Decimal
+from datetime import date, time
 
 
 router = APIRouter()
@@ -94,6 +103,269 @@ def run_self_check() -> dict:
         )
         s.commit()
         return {"ok": True, "report_hash": report_hash, "report": report}
+
+
+# ---------------------------
+# Admin: Calendar / Daily OHLCV baseline data
+# ---------------------------
+
+
+def _parse_day_to_date(d: str) -> date:
+    s = str(d or "").strip()
+    if not s:
+        raise ValueError("day is required")
+    if len(s) == 8 and s.isdigit():
+        return datetime.strptime(s, "%Y%m%d").date()
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+
+@router.post("/admin/calendar/upsert")
+def upsert_trading_calendar(payload: list[dict] = Body(...)) -> dict:
+    """Upsert trading calendar days.
+
+    Body: [{"day":"2026-01-16"|"20260116", "is_open":true, "note":"..."}, ...]
+    """
+    if not isinstance(payload, list) or not payload:
+        raise HTTPException(status_code=400, detail="payload must be a non-empty list")
+
+    ins = 0
+    upd = 0
+    with SessionLocal() as s:
+        for item in payload:
+            try:
+                day = _parse_day_to_date(item.get("day"))
+                is_open = bool(item.get("is_open", True))
+                note = str(item.get("note") or "") or None
+            except Exception:
+                continue
+
+            row = s.get(models.TradingCalendarDay, day)
+            if row is None:
+                s.add(models.TradingCalendarDay(day=day, is_open=is_open, note=note))
+                ins += 1
+            else:
+                row.is_open = is_open
+                row.note = note
+                upd += 1
+        s.commit()
+
+    return {"ok": True, "inserted": ins, "updated": upd}
+
+
+@router.post("/admin/daily_ohlcv/upsert")
+def upsert_daily_ohlcv(payload: list[dict] = Body(...)) -> dict:
+    """Upsert daily OHLCV facts.
+
+    Body: [{
+      "instrument_id":"SZ000001",
+      "trading_day":"2026-01-15"|"20260115",
+      "open": 10.1, "high": 10.5, "low": 9.9, "close": 10.2,
+      "volume": 123456.0, "amount": 987654321.0,
+      "source":"THS", "raw_hash":"..."}
+    ]
+    """
+    if not isinstance(payload, list) or not payload:
+        raise HTTPException(status_code=400, detail="payload must be a non-empty list")
+
+    ins = 0
+    upd = 0
+    skipped = 0
+    with SessionLocal() as s:
+        for item in payload:
+            try:
+                inst = normalize_symbol(item.get("instrument_id") or item.get("symbol"))
+                td = _parse_day_to_date(item.get("trading_day") or item.get("day"))
+                o = Decimal(str(item.get("open")))
+                h = Decimal(str(item.get("high")))
+                l = Decimal(str(item.get("low")))
+                c = Decimal(str(item.get("close")))
+                vol = item.get("volume")
+                amt = item.get("amount")
+                source = str(item.get("source") or "UNKNOWN")
+                raw_hash = str(item.get("raw_hash") or "") or None
+            except Exception:
+                skipped += 1
+                continue
+
+            row = (
+                s.execute(
+                    select(models.FactDailyOHLCV).where(
+                        models.FactDailyOHLCV.instrument_id == inst,
+                        models.FactDailyOHLCV.trading_day == td,
+                    )
+                )
+                .scalars()
+                .one_or_none()
+            )
+            if row is None:
+                s.add(
+                    models.FactDailyOHLCV(
+                        instrument_id=inst,
+                        trading_day=td,
+                        open=o,
+                        high=h,
+                        low=l,
+                        close=c,
+                        volume=Decimal(str(vol)) if vol is not None else None,
+                        amount=Decimal(str(amt)) if amt is not None else None,
+                        source=source,
+                        raw_hash=raw_hash,
+                    )
+                )
+                ins += 1
+            else:
+                row.open = o
+                row.high = h
+                row.low = l
+                row.close = c
+                row.volume = Decimal(str(vol)) if vol is not None else None
+                row.amount = Decimal(str(amt)) if amt is not None else None
+                row.source = source
+                row.raw_hash = raw_hash
+                upd += 1
+
+        s.commit()
+
+    return {"ok": True, "inserted": ins, "updated": upd, "skipped": skipped}
+
+
+# ---------------------------
+# Admin: Labels & Model Training (LightGBM)
+# ---------------------------
+
+
+@router.post("/admin/ml/labels3d")
+def build_labels_3d(trading_day: str = Body(..., embed=True), label_version: str | None = Body(None, embed=True)) -> dict:
+    """Generate 3D labels for the candidate pool on a given trading_day (T).
+
+    It will create rows in `model_training_label_3d` for symbols that have
+    the required Daily OHLCV facts for T, T+1..T+3.
+
+    Body:
+      {"trading_day":"20260115"|"2026-01-15", "label_version":"v1"}
+    """
+    try:
+        td = trading_day.strip()
+        if len(td) == 10 and "-" in td:
+            td = datetime.strptime(td, "%Y-%m-%d").strftime("%Y%m%d")
+        if not (len(td) == 8 and td.isdigit()):
+            raise ValueError
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid trading_day")
+
+    with SessionLocal() as s:
+        cnt = ensure_labels_for_candidates(s, trading_day=td, label_version=label_version)
+        s.commit()
+        return {"ok": True, "trading_day": td, "labels_upserted": cnt, "label_version": (label_version or settings.LABEL3D_VERSION)}
+
+
+@router.post("/admin/ml/train")
+def train_models(label_version: str | None = Body(None, embed=True), max_rows: int = Body(5000, embed=True)) -> dict:
+    """Train and activate LightGBM models for TP5_3D and TP8_3D.
+
+    Body: {"label_version":"v1", "max_rows":5000}
+    """
+    with SessionLocal() as s:
+        r5 = train_objective_lightgbm(s, OBJ_TP5_3D, label_version=label_version, max_rows=int(max_rows))
+        r8 = train_objective_lightgbm(s, OBJ_TP8_3D, label_version=label_version, max_rows=int(max_rows))
+        s.commit()
+        return {
+            "ok": True,
+            "trained": [
+                {"objective": r5.objective, "model_version": r5.model_version, "metrics": r5.metrics, "artifact_sha256": r5.artifact_sha256},
+                {"objective": r8.objective, "model_version": r8.model_version, "metrics": r8.metrics, "artifact_sha256": r8.artifact_sha256},
+            ],
+        }
+
+@router.post("/admin/ml/pipeline")
+def run_pipeline(payload: dict = Body(...)) -> dict:
+    """One-key pipeline: backfill OHLCV -> build labels -> train & activate.
+
+    Body example:
+      {
+        "start_day": "2026-01-01",
+        "end_day": "2026-01-15",
+        "label_version": "v1",
+        "do_backfill": true,
+        "do_labels": true,
+        "do_train": true,
+        "max_symbols_per_day": 5000,
+        "max_rows": 5000
+      }
+
+    Notes:
+    - Backfill uses DATA_PROVIDER (IFIND_HTTP / THS_DATAAPI / CUSTOM_HTTP / MOCK).
+    - Labels follow entry=Open(T+1) and max High(T+1..T+3).
+    """
+    from app.core.ml_pipeline import run_ml_pipeline
+
+    start_day = str(payload.get("start_day") or "").strip()
+    end_day = str(payload.get("end_day") or "").strip()
+    if not start_day or not end_day:
+        raise HTTPException(status_code=400, detail="start_day/end_day required")
+
+    label_version = payload.get("label_version")
+    do_backfill = bool(payload.get("do_backfill", True))
+    do_labels = bool(payload.get("do_labels", True))
+    do_train = bool(payload.get("do_train", True))
+    max_symbols_per_day = int(payload.get("max_symbols_per_day", 5000))
+    max_rows = int(payload.get("max_rows", 5000))
+
+    with SessionLocal() as s:
+        res = run_ml_pipeline(
+            s,
+            start_day=start_day,
+            end_day=end_day,
+            label_version=label_version,
+            do_backfill=do_backfill,
+            do_labels=do_labels,
+            do_train=do_train,
+            max_symbols_per_day=max_symbols_per_day,
+            max_rows=max_rows,
+        )
+        s.commit()
+        return {
+            "ok": True,
+            "trading_days": res.trading_days,
+            "backfill": res.backfill,
+            "labels": res.labels,
+            "train": res.train,
+            "activated": res.activated,
+            "started_ts": res.started_ts,
+            "finished_ts": res.finished_ts,
+        }
+
+
+
+@router.get("/admin/ml/models")
+def list_models(limit: int = 50) -> list[dict]:
+    """List recent model artifacts (including active flag)."""
+    with SessionLocal() as s:
+        rows = (
+            s.execute(
+                select(models.ModelArtifact)
+                .order_by(models.ModelArtifact.trained_ts.desc())
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+        out: list[dict] = []
+        for r in rows:
+            out.append(
+                {
+                    "objective": r.objective,
+                    "model_version": r.model_version,
+                    "feature_schema_version": r.feature_schema_version,
+                    "is_active": bool(r.is_active),
+                    "metrics": r.metrics or {},
+                    "feature_list": list(r.feature_list or []),
+                    "artifact_sha256": r.artifact_sha256,
+                    "trained_ts": r.trained_ts.isoformat() if r.trained_ts else None,
+                    "note": r.note,
+                }
+            )
+        return out
 
 
 @router.get("/admin/pool_rules")

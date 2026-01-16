@@ -156,3 +156,55 @@
 
 - `app/__init__.py`、`app/api/__init__.py`、`app/core/__init__.py`、`app/database/__init__.py`、`app/utils/__init__.py` 等  
   标记 Python package；内容为空是正常的（不影响运行）。
+
+---
+
+## 一键模型链路（日期范围：补齐标签 → 训练 → 激活）
+
+### 1) 关键接口
+
+- `POST /admin/ml/pipeline`
+
+请求体示例：
+
+```json
+{
+  "start_day": "2026-01-01",
+  "end_day": "2026-01-15",
+  "label_version": "v1",
+  "do_backfill": true,
+  "do_labels": true,
+  "do_train": true,
+  "max_symbols_per_day": 5000,
+  "max_rows": 5000
+}
+```
+
+行为：
+1. 解析 `[start_day, end_day]` 内的交易日序列
+2. （可选）按候选池 `labeling_candidate` 的 symbol 集合，补齐 `fact_daily_ohlcv`（用于 label）
+3. （可选）生成 `model_training_label_3d`（entry=Open(T+1)，future=High(T+1..T+3)）
+4. （可选）训练并激活 LightGBM：`TP5_3D` 与 `TP8_3D`
+
+### 2) fact_daily_ohlcv 数据来源（可切换）
+
+`fact_daily_ohlcv` 的补齐依赖 `DATA_PROVIDER`：
+
+- `DATA_PROVIDER=IFIND_HTTP`：调用 iFinD QuantAPI（需要 Token）
+  - `IFIND_HTTP_BASE_URL`
+  - `IFIND_HTTP_TOKEN` 或 `IFIND_HTTP_REFRESH_TOKEN`
+
+- `DATA_PROVIDER=THS_DATAAPI`：调用同花顺 dataapi（需要 Token，且不同租户返回结构可能不同）
+  - `THS_DATAAPI_BASE_URL`（默认 `https://dataapi.10jqka.com.cn`）
+  - `THS_DATAAPI_TOKEN`
+  - `THS_DAILY_ENDPOINT`（默认 `kline/daily`，如你租户不同可覆盖）
+
+- `DATA_PROVIDER=CUSTOM_HTTP`：调用你自有行情服务（由你决定 URL 与返回字段）
+  - `CUSTOM_DAILY_OHLCV_URL`
+  - `CUSTOM_DAILY_OHLCV_METHOD`（默认 POST）
+  - `CUSTOM_DAILY_HEADERS_JSON`（JSON 字符串）
+  - `CUSTOM_DAILY_BODY_JSON`（JSON 字符串；框架会注入 `codes/startdate/enddate/limit`）
+
+- 其它值：自动回落到离线 `MOCK`（可本地无网跑通链路，但不用于生产）
+
+> 说明：当前 backfill 统一走 `cmd_history_quotation` 的“表结构归一化”产物（iFinD-like tables/table）。如果你的自有接口字段不一致，只需要在 `app/adapters/data_provider.py` 的 `CustomHTTPProvider` 里补齐解析即可。

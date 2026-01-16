@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     # If true, realtime-like pulls (e.g. 16:00 candidate pool) will be skipped on non-trading days.
     REALTIME_ONLY_ON_TRADING_DAYS: bool = True
 
+    # Programmatic calendar code for pandas_market_calendars (ISO 10383 MIC).
+    # For A-share, XSHG (SSE) is a practical default.
+    MARKET_CALENDAR_CODE: str = "XSHG"
+
     # --- Recommendation output ---
     RECOMMEND_TOPN: int = 10
     RECOMMEND_DEADLINE_HHMM: str = "08:30"    # T+1 deadline
@@ -86,6 +90,23 @@ class Settings(BaseSettings):
     IFIND_HTTP_BASE_URL: str = "https://quantapi.51ifind.com"
     IFIND_HTTP_REFRESH_TOKEN: str = ""
     IFIND_HTTP_TOKEN: str = ""
+
+    # --- Daily OHLCV backfill (for labels/training) ---
+    # Provider selection is controlled by DATA_PROVIDER.
+    # Supported (offline-capable):
+    #   - IFIND_HTTP: call iFinD QuantAPI via HTTP (requires tokens)
+    #   - THS_DATAAPI: call 10jqka dataapi (requires token; response format may vary by tenant)
+    #   - CUSTOM_HTTP: call your own OHLCV service (CUSTOM_DAILY_OHLCV_*)
+    #   - MOCK: deterministic offline mock (default when DATA_PROVIDER is not IFIND_HTTP/THS_DATAAPI/CUSTOM_HTTP)
+    THS_DATAAPI_BASE_URL: str = "https://dataapi.10jqka.com.cn"
+    THS_DATAAPI_TOKEN: str = ""
+    # Endpoint name (joined as {base}/dataapi/{endpoint}); override to match your tenant.
+    THS_DAILY_ENDPOINT: str = "kline/daily"
+
+    CUSTOM_DAILY_OHLCV_URL: str = ""
+    CUSTOM_DAILY_OHLCV_METHOD: str = "POST"
+    CUSTOM_DAILY_HEADERS_JSON: str = "{}"
+    CUSTOM_DAILY_BODY_JSON: str = "{}"
 
     # Token manager tuning (used when IFIND_HTTP_REFRESH_TOKEN is provided)
     # access_token is said to be ~7 days; we refresh a bit early.
@@ -153,6 +174,22 @@ class Settings(BaseSettings):
 
     # Safety: cap how many symbols we plan/enqueue per pipeline cycle
     LABELING_MAX_SYMBOLS_PER_CYCLE: int = 50
+
+    # --- Model (TP5/TP8, 3-day window anchored at Open(T+1)) ---
+    LABEL3D_VERSION: str = "v1"
+    LABEL3D_GAP_RISK_THRESH: float = 0.06
+    LABEL3D_LIQUIDITY_MIN_AMOUNT: float = 1e8
+
+    # LightGBM training knobs (defaults are conservative)
+    LGBM_NUM_BOOST_ROUND: int = 300
+    LGBM_LEARNING_RATE: float = 0.05
+    LGBM_NUM_LEAVES: int = 31
+    LGBM_MIN_DATA_IN_LEAF: int = 50
+    LGBM_FEATURE_FRACTION: float = 0.9
+    LGBM_BAGGING_FRACTION: float = 0.9
+    LGBM_BAGGING_FREQ: int = 1
+    LGBM_L2_REG: float = 0.0
+    LGBM_SEED: int = 42
 
     @field_validator("API_ROOT_PATH", mode="before")
     @classmethod
